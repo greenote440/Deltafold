@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+
+# IDE
+.claude/
+.vscode/
+.idea/
+
+# Data and Models
+checkpoints/
+clusters/
+data/
+DEBUG/
+extracted_samples/
+structure_foldseek_database_2023-11-27/
+*.pt
+*.pth
+*.ckpt
+
+# Processing Artifacts
+*.jsonl
+*.jsonl.gz
+*.pkl
+*.pickle
+*.npy
+*.npz
+
+# System
+.DS_Store
+.env
+*.log
