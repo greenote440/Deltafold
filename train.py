@@ -298,11 +298,12 @@ def main():
     parser.add_argument('--hard-neg-beta', dest='hard_neg_beta', type=float, default=0.0, help="Hard-negative reweighting strength for InfoNCE (0=off; report 7).")
     parser.add_argument('--hard-neg-mining', dest='hard_neg_mining', action='store_true', help="Build batches of length/SSE-matched proteins so negatives are superficially similar but topologically distinct (report 7 #1).")
     parser.add_argument('--cleanup-every', dest='cleanup_every', type=int, default=10, help="Run MPS gc/empty_cache every N steps (default 50; 0 disables per-step cleanup). Lower = less peak RAM but much slower on MPS.")
-    parser.add_argument('--max-residues', dest='max_residues', type=int, default=4000, help="With --hard-neg-mining, cap ORIGINAL residues per batch (forward sees ~1.75x after 2 views). Default 4000 keeps batches off the MPS memory-swap cliff. Lower = lighter/faster steps.")
+    parser.add_argument('--max-residues', dest='max_residues', type=int, default=3500, help="With --hard-neg-mining, cap ORIGINAL residues per batch (forward sees ~1.75x after 2 views). Default 4000 keeps batches off the MPS memory-swap cliff. Lower = lighter/faster steps.")
     parser.add_argument('--no-pad-buckets', dest='pad_buckets', action='store_false', help="Disable bucket-padding of batch shapes. Padding bounds the number of distinct MPS kernels (avoids per-epoch slowdown from kernel-cache bloat); only disable for debugging.")
     parser.add_argument('--mem-soft-gb', dest='mem_soft_gb', type=float, default=11.0, help="Soft RSS cap (GB): above this, force an off-schedule gc+empty_cache every step. 0 disables the governor's pressure logic.")
     parser.add_argument('--mem-hard-gb', dest='mem_hard_gb', type=float, default=14.0, help="Hard RSS cap (GB): above this (after a reclaim attempt), cold-restart DataLoader workers and shrink the residue budget. Keeps headroom below the 16GB swap cliff. 0 disables.")
-    parser.add_argument('--min-residues', dest='min_residues', type=int, default=2000, help="Floor for the dynamic residue-budget shrink under memory pressure.")
+    parser.add_argument('--min-residues', dest='min_residues', type=int, default=3500, help="Floor for the dynamic residue-budget shrink under memory pressure.")
+    parser.add_argument('--no-budget-adapt', dest='no_budget_adapt', action='store_true', help="Disable dynamic residue-budget shrink under memory pressure (keeps cold restarts).")
     parser.add_argument('--split', type=str, choices=['cluster', 'phylo'], default='cluster', help="Train/val split: cluster-aware or phylogenetic by taxid (report 7).")
     parser.add_argument('--tm-aux-weight', dest='tm_aux_weight', type=float, default=0.0, help="Weight of the TM-score regression auxiliary loss (0=off; report 7/3.4).")
     parser.add_argument('--unsupervised', dest='unsupervised', action='store_true', help="Use plain InfoNCE instead of cluster-label SupCon (avoids taxonomic label leakage, report 4.1).")
@@ -361,6 +362,7 @@ def main():
             mem_soft_gb=args.mem_soft_gb,
             mem_hard_gb=args.mem_hard_gb,
             min_residues=args.min_residues,
+            no_budget_adapt=args.no_budget_adapt,
         )
 
     if args.cprofile:

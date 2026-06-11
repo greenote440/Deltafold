@@ -90,17 +90,7 @@ class AsymmetricTopoAttentionLayer(nn.Module):
             nn.Linear(dim * 2, dim)
         )
 
-    def scalarize_vectors(self, vector_feat, frames):
-        """
-        Projects vector features onto SO(3)-equivariant frames.
-        vector_feat: (N, 3)
-        frames: (N, 3, 3)
-        Returns: (N, 3) scalarized features
-        """
-        # Batch matrix multiplication: (N, 1, 3) x (N, 3, 3) -> (N, 1, 3)
-        return torch.bmm(vector_feat.unsqueeze(1), frames).squeeze(1)
-
-    def forward(self, h0, h1, h2, h3, src, dst, sse_map_0=None, nodes_per_sse=None, batch_idx_0=None, batch_idx_2=None, B=1, edge_dist=None):
+    def forward(self, h0, h1, h2, h3, src, dst, sse_map_0=None, batch_idx_0=None, batch_idx_2=None, B=1, edge_dist=None):
 
         # Pre-flatten indices for 2D operations
         src_flat = src.flatten()
@@ -294,13 +284,12 @@ class AsymmetricTopoNet(nn.Module):
         h3 = self.rank3_emb(self.rank3_input_norm(h3_raw))
         
         sse_map_0 = features.get('sse_map_0')
-        nodes_per_sse = features.get('nodes_per_sse')
         # Per-edge Ca-Ca distance for the geometric attention bias (§5.4). Flattened
         # to (E,) to match src/target.flatten(); zero for padded dummy edges (which
         # self-loop on dummy nodes, so they never reach real nodes).
         edge_dist = r1['distance'].flatten()
         for layer in self.layers:
-            h0, h1, h2, h3 = layer(h0, h1, h2, h3, r1['source'], r1['target'], sse_map_0, nodes_per_sse, batch_idx_0, batch_idx_2, B, edge_dist=edge_dist)
+            h0, h1, h2, h3 = layer(h0, h1, h2, h3, r1['source'], r1['target'], sse_map_0, batch_idx_0, batch_idx_2, B, edge_dist=edge_dist)
             
         h0_sum = torch.zeros(B, h0.size(-1), device=device).index_add_(0, batch_idx_0, h0)
         h0_count = torch.zeros(B, 1, device=device).index_add_(0, batch_idx_0, torch.ones_like(h0[:, :1]))

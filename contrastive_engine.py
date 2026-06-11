@@ -1,13 +1,33 @@
 """
-Contrastive Learning Engine for Deltafold
-Implements structural augmentations and InfoNCE loss to train Topological 
-Representations without labels.
+Contrastive Learning Engine for Deltafold.
+
+This module holds the two halves of the self-/weakly-supervised contrastive
+objective:
+
+  1. `StructuralAugmentations` — generates two augmented "views" of a Protein
+     Combinatorial Complex (coordinate jitter, optional SSE cropping, feature
+     masking).
+  2. The loss family that turns those views (and optional cluster labels /
+     TM-scores) into a training signal:
+       * `NTXentLoss`              — unsupervised InfoNCE, optional hard-negative
+                                     reweighting.
+       * `supervised_ntxent_loss`  — SupCon over cluster labels (binary positives).
+       * `soft_supcon_loss`        — SupCon with TM-score-weighted positives.
+       * `tm_score_aux_loss[_cached]` — auxiliary TM-score regression.
+       * `build_tm_matrix`         — dense in-batch TM-score matrix from the cache.
+       * `collapse_metrics`        — representation-collapse diagnostics.
+
+The §-references throughout point to tm_score_analysis.md, which motivates each
+objective variant. This module depends only on torch/numpy (+ optional tmtools);
+it is deliberately free of any training-loop or dataset imports.
 """
+import math
+import os
+import random
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import random
-import math
 
 class StructuralAugmentations:
     """
@@ -227,3 +247,215 @@ class NTXentLoss(nn.Module):
 
         log_denom = torch.logsumexp(weighted, dim=1)
         return (log_denom - pos).mean()
+
+
+# Amino-acid alphabet used to reconstruct one-letter sequences for tmtools
+# alignment (mirrors topotein_lifter / evaluate_correlation).
+AA_ALPHABET = "ACDEFGHIKLMNPQRSTVWYUO"
+
+
+def collapse_metrics(z):
+    """Per-batch collapse signals (report 7, "collapse detection during training").
+    Returns (embedding std, mean off-diagonal cosine similarity). A shrinking std
+    or a mean cosine approaching 1.0 indicates representation collapse."""
+    with torch.no_grad():
+        zn = F.normalize(z, p=2, dim=-1)
+        emb_std = zn.std(dim=0).mean().item()
+        n = zn.size(0)
+        sims = zn @ zn.t()
+        off = sims[~torch.eye(n, dtype=torch.bool, device=zn.device)]
+        mean_cos = off.mean().item()
+    return emb_std, mean_cos
+
+
+def tm_score_aux_loss(z, features, num_pairs=8):
+    """Auxiliary TM-score regression (report 7, "add a TM-score regression loss").
+    Directly supervises embedding cosine similarity to track TM-score ordering,
+    reducing the contrastive/TM-score objective mismatch (report 3.4). Computed on
+    a few sampled in-batch pairs; tmtools alignment runs on CPU. Returns None if no
+    pair could be aligned."""
+    try:
+        import tmtools
+    except ImportError:
+        return None
+    import numpy as np
+
+    batch_idx = features['batch_idx_0']
+    ca = features['rank0']['ca_coords']
+    aa = features['rank0']['aa']
+    B2 = z.size(0)
+
+    coords, seqs = [], []
+    for b in range(B2):
+        m = (batch_idx == b)
+        c = ca[m].detach().cpu().numpy().astype(np.float32)
+        if c.shape[0] < 3:
+            coords.append(None); seqs.append(None); continue
+        idx = aa[m].detach().cpu().numpy().argmax(axis=1)
+        seqs.append("".join(AA_ALPHABET[i] if i < len(AA_ALPHABET) else "X" for i in idx))
+        coords.append(c)
+
+    valid = [b for b in range(B2) if coords[b] is not None]
+    if len(valid) < 2:
+        return None
+
+    zn = F.normalize(z, p=2, dim=-1)
+    terms = []
+    for _ in range(num_pairs):
+        i, j = random.sample(valid, 2)
+        try:
+            res = tmtools.tm_align(coords[i], coords[j], seqs[i], seqs[j])
+            tm = max(res.tm_norm_chain1, res.tm_norm_chain2)
+        except Exception:
+            continue
+        target = 2.0 * tm - 1.0          # map TM [0,1] -> cosine target [-1,1]
+        pred = (zn[i] * zn[j]).sum()     # cosine similarity (z is unit-normalized)
+        terms.append((pred - target) ** 2)
+    if not terms:
+        return None
+    return torch.stack(terms).mean()
+
+
+def tm_score_aux_loss_cached(z, paths, tm_cache, num_pairs=16):
+    """Cached variant of the TM-score regression auxiliary (analysis §5.2).
+
+    Uses pre-computed pairwise TM-scores (see build_tm_cache.py) instead of paying
+    ~0.5s/pair on-the-fly tmtools alignment, which is what kept tm_score_aux_loss
+    disabled. Directly optimises rho: it pulls each pair's embedding cosine toward
+    2*TM-1, so minimising it is minimising the squared deviation of cosine from
+    TM-score. `paths` is the 2B view-path list (aligned to z); two augmented views
+    of the same protein (equal basename) get target TM=1."""
+    B = z.size(0)
+    if B < 2 or not tm_cache:
+        return None
+    zn = F.normalize(z, p=2, dim=-1)
+    bns = [os.path.basename(p) for p in paths]
+    terms = []
+    for _ in range(num_pairs):
+        i, j = random.sample(range(B), 2)
+        if bns[i] == bns[j]:
+            tm = 1.0  # two augmented views of the same protein
+        else:
+            tm = tm_cache.get((bns[i], bns[j]))
+            if tm is None:
+                tm = tm_cache.get((bns[j], bns[i]))
+        if tm is None:
+            continue
+        target = 2.0 * float(tm) - 1.0      # TM [0,1] -> cosine target [-1,1]
+        pred = (zn[i] * zn[j]).sum()
+        terms.append((pred - target) ** 2)
+    if not terms:
+        return None
+    return torch.stack(terms).mean()
+
+
+def build_tm_matrix(paths, tm_cache, device):
+    """Dense N x N TM-score matrix for the in-batch proteins from the sparse cache
+    (analysis §5.6). Unknown pairs are NaN (soft_supcon_loss falls back to binary
+    weights there); identical basenames (the two views of one protein) are 1.0."""
+    n = len(paths)
+    bns = [os.path.basename(p) for p in paths]
+    mat = torch.full((n, n), float('nan'), device=device)
+    for i in range(n):
+        for j in range(i + 1, n):
+            if bns[i] == bns[j]:
+                tm = 1.0
+            else:
+                tm = tm_cache.get((bns[i], bns[j]))
+                if tm is None:
+                    tm = tm_cache.get((bns[j], bns[i]))
+            if tm is not None:
+                mat[i, j] = mat[j, i] = float(tm)
+    return mat
+
+
+def soft_supcon_loss(embeddings, labels, tm_matrix, temperature=0.1):
+    """Continuous (soft) supervised contrastive loss (analysis §5.6).
+
+    Identical structure to supervised_ntxent_loss, but positive pairs are weighted
+    by their actual TM-score rather than a binary same-cluster label. This turns the
+    objective from "collapse each cluster to a point" (rho ceiling = 0) into "place
+    proteins at embedding distances proportional to their structural distance" --
+    the correct objective for a TM-score-correlated metric. Same-cluster pairs with
+    no cached TM-score fall back to binary weight 1.0."""
+    embeddings = F.normalize(embeddings, p=2, dim=-1)
+    N = embeddings.shape[0]
+    dev = embeddings.device
+
+    logits = torch.matmul(embeddings, embeddings.T) / temperature
+    logits_max, _ = torch.max(logits, dim=1, keepdim=True)
+    logits = logits - logits_max.detach()
+
+    self_mask = 1.0 - torch.eye(N, device=dev)
+    labels = labels.contiguous().view(-1, 1)
+    labels_eq = torch.eq(labels, labels.T).float().to(dev) * self_mask   # same cluster, not self
+
+    # Positive weights: TM-score where same-cluster AND cached, else binary fallback.
+    pos_weights = labels_eq.clone()
+    known = ~torch.isnan(tm_matrix)
+    if known.any():
+        pos_weights[known] = labels_eq[known] * tm_matrix[known].clamp(0, 1)
+    row_sum = pos_weights.sum(dim=1, keepdim=True).clamp(min=1e-6)
+    pos_weights_norm = pos_weights / row_sum
+
+    exp_logits = torch.exp(logits) * self_mask
+    log_denom = torch.log(exp_logits.sum(1, keepdim=True) + 1e-6)
+    log_prob = logits - log_denom
+
+    has_pos = labels_eq.sum(1) > 0
+    loss = -(pos_weights_norm * log_prob).sum(1)
+    return loss[has_pos].mean() if has_pos.any() else logits.sum() * 0.0
+
+
+def supervised_ntxent_loss(embeddings, labels, temperature=0.1, hard_neg_beta=0.0):
+    """
+    Supervised Contrastive Loss (SupCon) with optional hard-negative reweighting.
+
+    hard_neg_beta > 0 up-weights negatives that are most similar to the anchor
+    (the hardest ones) in the denominator, matching the same mechanism used by
+    NTXentLoss on the unsupervised path.  beta=0 is the standard SupCon loss.
+    """
+    # embeddings: (N, dim), labels: (N,)
+    N = embeddings.shape[0]
+    dev = embeddings.device
+
+    labels = labels.contiguous().view(-1, 1)
+    pos_mask = torch.eq(labels, labels.T).float().to(dev)       # 1 where same cluster
+
+    logits = torch.matmul(embeddings, embeddings.T) / temperature
+
+    # Numerical stability shift
+    logits_max, _ = torch.max(logits, dim=1, keepdim=True)
+    logits = logits - logits_max.detach()
+
+    # self_mask[i,i] = 0, elsewhere 1
+    self_mask = 1.0 - torch.eye(N, device=dev)
+    # positive mask excludes self
+    pos_mask = pos_mask * self_mask
+    # negative mask: not self, not positive
+    neg_mask = self_mask * (1.0 - pos_mask)
+
+    if hard_neg_beta <= 0:
+        # Standard SupCon denominator: all non-self terms
+        exp_logits = torch.exp(logits) * self_mask
+        log_denom = torch.log(exp_logits.sum(1, keepdim=True) + 1e-6)
+    else:
+        # Reweight negatives toward hard ones (same log-space trick as NTXentLoss).
+        # Positives keep weight 1; negatives get weight proportional to exp(beta*sim).
+        num_neg = neg_mask.sum(1, keepdim=True).clamp(min=1)
+        w_logits = (hard_neg_beta * logits.detach()).masked_fill(neg_mask == 0, -float('inf'))
+        log_norm = torch.logsumexp(w_logits, dim=1, keepdim=True)
+        log_w_neg = torch.log(num_neg) + w_logits - log_norm   # (N,N), -inf off-negatives
+
+        # Weighted denominator: positives contribute exp(logit), negatives exp(logit+log_w)
+        pos_contrib = (torch.exp(logits) * pos_mask).sum(1, keepdim=True)
+        neg_contrib = torch.exp(logits + log_w_neg.masked_fill(neg_mask == 0, -float('inf')))
+        neg_contrib = neg_contrib.sum(1, keepdim=True)
+        log_denom = torch.log(pos_contrib + neg_contrib + 1e-6)
+
+    log_prob = logits - log_denom
+    # Mean log-likelihood over positives (ignore rows with no positive)
+    n_pos = pos_mask.sum(1)
+    has_pos = n_pos > 0
+    mean_log_prob_pos = (pos_mask * log_prob).sum(1) / (n_pos + 1e-6)
+    return -mean_log_prob_pos[has_pos].mean() if has_pos.any() else logits.sum() * 0.0

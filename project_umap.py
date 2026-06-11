@@ -14,9 +14,12 @@ visualisation and annotation table consume).
     python project_umap.py --neighbors 15 50 --min-dist 0.1 --seed 42
 """
 import os
+import sys
 import argparse
 import numpy as np
+from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).parent / 'scripts' / 'analysis'))
 import cluster_common as cc
 
 

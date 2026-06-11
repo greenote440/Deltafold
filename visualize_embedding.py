@@ -14,8 +14,11 @@ interactive UMAP scatter plots:
     python visualize_embedding.py --annotations clusters/cluster_annotations.tsv
 """
 import os
+import sys
 import argparse
+from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).parent / 'scripts' / 'analysis'))
 import cluster_common as cc
 
 GENOME_COLORS = {

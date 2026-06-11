@@ -16,11 +16,14 @@ Phase 4 - Biological validation ("easter eggs").
     python validate_test_cases.py --pair <idA> <idB> --query <id>
 """
 import os
+import sys
 import argparse
+from pathlib import Path
 from collections import defaultdict
 
 import numpy as np
 
+sys.path.insert(0, str(Path(__file__).parent / 'scripts' / 'analysis'))
 import cluster_common as cc
 
 TARGET_CASES = {
