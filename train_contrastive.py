@@ -979,6 +979,12 @@ def _run_training_epoch(model, head, train_loader, val_loader, optimizer, schedu
                 if _rs['restart']:
                     break
             del loader
+            # Force immediate worker cleanup: MPS worker memory may not release with just del.
+            # Explicit multi-step reclaim prevents memory lingering after restart (restart spam root cause).
+            gc.collect()
+            if DEVICE.type == 'mps':
+                torch.mps.empty_cache()
+            gc.collect()
             governor._reclaim()   # workers are now torn down; reclaim their pool too
             restart_pass += 1
             if not _rs['restart']:
@@ -1030,9 +1036,11 @@ def _run_training_epoch(model, head, train_loader, val_loader, optimizer, schedu
                     # §5.6: continuous (TM-weighted) supervised contrastive objective.
                     tm_matrix = build_tm_matrix(paths, tm_cache, z.device)
                     loss = soft_supcon_loss(z, labels, tm_matrix, temperature=0.1)
+                    del tm_matrix  # Free immediately; loss computation holds copy in autograd graph
                 else:
                     loss = supervised_ntxent_loss(z, labels, temperature=0.1,
                                                   hard_neg_beta=criterion.hard_neg_beta)
+                del cluster_ids, label_map  # Free CPU-side metadata
             else:
                 B = z.size(0) // 2
                 loss = criterion(z[:B], z[B:])
@@ -1222,6 +1230,7 @@ def _run_training_epoch(model, head, train_loader, val_loader, optimizer, schedu
             print(f"  Epoch eval: {epoch_eval.format_line(eval_metrics)}")
         except Exception as e:
             print(f"  [epoch_eval skipped: {e}]")
+        del embs, labels  # Free large ARI embedding arrays after evaluation
 
     # Track best by val loss AND by ARI separately, since changing hard_neg_beta
     # shifts the loss scale and makes val-loss-only checkpointing unreliable.
