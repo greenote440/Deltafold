@@ -9,12 +9,29 @@
 
 ---
 
+## ⚠️ CRITICAL: Memory Hard Cap Setting
+
+**ALWAYS use `--mem-hard-gb 12.0`** on M1 Pro with 16GB RAM.
+
+**Why?**
+- Default is 14GB, which leaves only 2GB for OS (too tight!)
+- With 14GB: restarts every epoch → training degrades → ARI drops
+- With 12GB: 0-1 restarts per epoch → clean training → metrics improve
+
+**What happens with wrong cap:**
+```
+--mem-hard-gb 14.0  → 6 restarts/epoch → ARI: 0.2262 → 0.1849 (drop 18%)
+--mem-hard-gb 12.0  → 0-1 restarts/epoch → ARI: stable and improving
+```
+
+---
+
 ## Run Training Now
 
 ```bash
 cd /Users/macbook/Documents/Deltafold
 
-# RECOMMENDED: Safe defaults with 12GB hard cap
+# RECOMMENDED: Safe defaults with 12GB hard cap (ALWAYS USE THIS)
 python train.py --model asymmetric \
   --no-positional --no-residue \
   --hard-neg-mining --split phylo \
@@ -22,11 +39,23 @@ python train.py --model asymmetric \
   --epochs 50 --batch_size 64 \
   --mem-hard-gb 12.0
 
-# ALTERNATIVE: Faster but riskier (14GB hard cap)
-# python train.py ... --mem-hard-gb 14.0
+# If resuming from epoch 10:
+python train.py --model asymmetric \
+  --no-positional --no-residue \
+  --hard-neg-mining --split phylo \
+  --tm-cache ./checkpoints/tm_score_cache.pt --tm-aux-weight 0.1 \
+  --epochs 50 --batch_size 64 \
+  --mem-hard-gb 12.0 \
+  --resume-epoch 10
+```
 
-# CONSERVATIVE: Slower but safest (11GB hard cap)
-# python train.py ... --mem-hard-gb 11.0
+**⛔ DO NOT USE:**
+```bash
+# Wrong! Default 14GB cap causes restart spam
+python train.py --model asymmetric ... --epochs 50 --batch_size 64
+
+# Wrong! Too conservative, wastes hardware
+python train.py --model asymmetric ... --epochs 50 --batch_size 64 --mem-hard-gb 11.0
 ```
 
 ---
