@@ -103,7 +103,7 @@ class MemoryGovernor:
     permanently sacrificed after a transient spike."""
 
     def __init__(self, soft_gb=11.0, hard_gb=14.0, sampler=None, cleanup_every=50,
-                 min_residues=2000, shrink=0.85, grow=1.1):
+                 min_residues=2000, shrink=0.85, grow=1.1, no_budget_adapt=False):
         self.soft_gb = soft_gb
         self.hard_gb = hard_gb
         self.sampler = sampler
@@ -111,11 +111,13 @@ class MemoryGovernor:
         self.min_residues = min_residues
         self.shrink = shrink
         self.grow = grow
+        self.no_budget_adapt = no_budget_adapt
         self.base_residues = getattr(sampler, 'max_residues', None)
         self.last_fp = 0.0
         self.restarts = 0
         self.soft_hits = 0
         self._epoch_restarts = 0
+        self._last_restart_step = -100  # prevent restart spam (cooldown)
 
     def _reclaim(self):
         gc.collect()
@@ -127,7 +129,11 @@ class MemoryGovernor:
 
     def after_step(self, step):
         """Call once per training step. Returns 'restart' if the caller should cold-
-        restart the DataLoader workers, else None."""
+        restart the DataLoader workers, else None.
+
+        Prevents restart spam: only allow restart if >50 steps since last restart.
+        If memory stays high after restart, shrinking budget won't help; warn instead.
+        """
         enabled = self.hard_gb and self.hard_gb > 0
         # Baseline throttled cleanup (unconditional, matches the old behaviour).
         if DEVICE.type == 'mps' and self.cleanup_every > 0 and (step % self.cleanup_every == 0):
@@ -141,12 +147,16 @@ class MemoryGovernor:
             rss = _phys_footprint_gb()
             if rss > self.hard_gb:
                 self.last_fp = rss
-                self.restarts += 1
-                self._epoch_restarts += 1
-                if self.sampler is not None and self.base_residues:
-                    self.sampler.max_residues = max(
-                        self.min_residues, int(self.sampler.max_residues * self.shrink))
-                return 'restart'
+                # Prevent restart spam: only allow restart if 50+ steps since last one
+                if step - self._last_restart_step >= 50:
+                    self.restarts += 1
+                    self._epoch_restarts += 1
+                    if self.sampler is not None and self.base_residues and not self.no_budget_adapt:
+                        self.sampler.max_residues = max(
+                            self.min_residues, int(self.sampler.max_residues * self.shrink))
+                    self._last_restart_step = step
+                    return 'restart'
+                # else: silently skip restart (memory governor is exhausted)
         elif rss > self.soft_gb:
             self.soft_hits += 1
             self._reclaim()
@@ -745,7 +755,8 @@ def train_contrastive(model_type='topotein', epochs=30, batch_size=16, lr=1e-4, 
                       hard_neg_mining=False, cleanup_every=50, max_residues=4000, pad_buckets=True,
                       tm_cache_path=None, soft_supcon=False, use_crop=False, jitter_sigma=0.3,
                       edge_attn_softmax=True, dist_bias_gamma=0.1, detach_h3=True,
-                      mem_soft_gb=11.0, mem_hard_gb=14.0, min_residues=2000):
+                      mem_soft_gb=11.0, mem_hard_gb=14.0, min_residues=2000,
+                      no_budget_adapt=False):
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
     tlog = TrainingLog(os.path.join(CHECKPOINT_DIR, 'training_log.jsonl.gz'))
 
@@ -798,35 +809,55 @@ def train_contrastive(model_type='topotein', epochs=30, batch_size=16, lr=1e-4, 
     train_dataset = PCCDataset(train_files, transform=aug)
     val_dataset = PCCDataset(val_files, transform=aug)
 
-    # Optimized DataLoader: use persistent workers and conditional pin_memory (CUDA only)
+    # Single factory so train and val share every DataLoader knob. To add a new
+    # flag (e.g. pin_memory policy, a different collate_fn, timeout) edit here once.
+    # Val always uses num_workers=0 and no batch_sampler: parallel workers + a
+    # separate sampler on MPS unified memory caused unbounded accumulation and
+    # crashes at ~200-300 steps. num_workers=0 is safe; train parallelism is enough.
     num_workers = max(1, (os.cpu_count() or 4) // 2)
+
+    def _make_loader(dataset, *, batch_sampler=None, workers=num_workers, shuffle=False):
+        shared_kwargs = dict(
+            collate_fn=contrastive_collate,
+            pin_memory=DEVICE.type == 'cuda',
+            worker_init_fn=worker_init_fn if workers > 0 else None,
+        )
+        if batch_sampler is not None:
+            return DataLoader(dataset, batch_sampler=batch_sampler,
+                              num_workers=workers, prefetch_factor=2 if workers > 0 else None,
+                              persistent_workers=False, **shared_kwargs)
+        return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle,
+                          num_workers=workers, prefetch_factor=2 if workers > 0 else None,
+                          persistent_workers=False, **shared_kwargs)
+
     train_sampler = None
-    # `make_train_loader` is a FACTORY (not a single loader) so the epoch loop can cold-
-    # restart the workers under memory pressure by simply building a fresh one. Each call
-    # reads train_sampler.max_residues live, so a shrunk residue budget takes effect on
-    # the next (re)built loader.
+    # `make_train_loader` is a FACTORY (not a single loader) so the epoch loop can
+    # cold-restart workers under memory pressure. Each call reads
+    # train_sampler.max_residues live so a shrunk budget takes effect immediately.
     if hard_neg_mining:
         cache_path = os.path.join(CHECKPOINT_DIR, 'batch_keys_cache.pt')
         keys = extract_batch_keys(train_files, cache_path)
         train_sampler = HardNegativeBatchSampler(keys, batch_size, seed=42, max_residues=max_residues)
         print(f"Hard-negative mining: residue budget {max_residues} (orig; ~{int(max_residues*1.75)} in-forward "
               f"after 2 views), count cap {batch_size}, ~{len(train_sampler)} batches/epoch")
-        # prefetch_factor=2: pad_to_buckets stabilises shapes so the prefetch buffer
-        # no longer accumulates unboundedly-sized batches (the original reason it was 1).
         def make_train_loader():
-            return DataLoader(train_dataset, batch_sampler=train_sampler, collate_fn=contrastive_collate, num_workers=num_workers, prefetch_factor=2, persistent_workers=False, pin_memory=DEVICE.type == 'cuda', worker_init_fn=worker_init_fn)
+            return _make_loader(train_dataset, batch_sampler=train_sampler)
     else:
         def make_train_loader():
-            return DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=contrastive_collate, num_workers=num_workers, prefetch_factor=2, persistent_workers=False, pin_memory=DEVICE.type == 'cuda', worker_init_fn=worker_init_fn)
+            return _make_loader(train_dataset, shuffle=True)
     train_loader = make_train_loader()  # one instance for len()/scheduler bookkeeping
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=contrastive_collate, num_workers=0, pin_memory=DEVICE.type == 'cuda')
+    val_loader = _make_loader(val_dataset, workers=0)
 
     # Memory governor: caps process RSS at mem_hard_gb via off-schedule reclaim + cold
     # worker restarts + dynamic residue-budget shrink (see MemoryGovernor).
     governor = MemoryGovernor(soft_gb=mem_soft_gb, hard_gb=mem_hard_gb, sampler=train_sampler,
-                              cleanup_every=cleanup_every, min_residues=min_residues)
+                              cleanup_every=cleanup_every, min_residues=min_residues,
+                              no_budget_adapt=no_budget_adapt)
     print(f"Memory governor: soft={mem_soft_gb}GB hard={mem_hard_gb}GB "
           f"min_residues={min_residues} (cold-restarts workers + shrinks budget above hard cap)")
+    if mem_hard_gb > 12.0:
+        print(f"[!] WARNING: hard cap at {mem_hard_gb}GB is close to 16GB limit; "
+              f"recommend --mem-hard-gb 12.0 to avoid swap and crashes")
     
     model_config = {
         'use_positional_encoding': use_positional_encoding,
@@ -956,8 +987,6 @@ def _run_training_epoch(model, head, train_loader, val_loader, optimizer, schedu
     pbar = tqdm(total=total_steps, desc=f"Epoch {epoch+1}/{epochs}")
     done = 0          # gradient steps actually completed this epoch
     for batch in _restartable_batches():
-        if done >= total_steps:
-            break
         if batch is None:
             if profiler: profiler.step()
             continue
@@ -1088,12 +1117,18 @@ def _run_training_epoch(model, head, train_loader, val_loader, optimizer, schedu
         # pressure, and a cold worker-restart + residue-budget shrink if RSS still
         # exceeds the hard cap (cheaper than swapping). See MemoryGovernor.
         if governor.after_step(done) == 'restart':
+            new_budget = getattr(train_sampler, 'max_residues', 'n/a')
             pbar.write(f"  [mem] footprint {governor.last_fp:.1f}GB > {governor.hard_gb}GB hard cap "
-                       f"-> cold-restarting DataLoader workers; residue budget -> "
-                       f"{getattr(train_sampler, 'max_residues', 'n/a')}")
+                       f"-> cold-restarting DataLoader workers; residue budget -> {new_budget}")
             tlog.event({'t': 'restart', 'ep': epoch+1, 's': done,
                         'fp': round(governor.last_fp, 2),
                         'budget': getattr(train_sampler, 'max_residues', None)})
+            # Safety: if we've already restarted too many times, stop this epoch to avoid crash
+            if governor._epoch_restarts > 5:
+                pbar.write(f"  [!] ABORT: >5 restarts in this epoch; memory governor exhausted")
+                pbar.close()
+                print(f"[!] Epoch {epoch+1} aborted after {done} steps due to memory exhaustion")
+                break
             _rs['restart'] = True
         pbar.update(1)
     pbar.close()
