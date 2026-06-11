@@ -1224,6 +1224,9 @@ def _run_training_epoch(model, head, train_loader, val_loader, optimizer, schedu
 
         # Deeper per-epoch health check: HDBSCAN cluster + TM-rho / homology recall.
         try:
+            import sys
+            from pathlib import Path
+            sys.path.insert(0, str(Path(__file__).parent / 'scripts' / 'analysis'))
             import epoch_eval
             ev_ids = [os.path.basename(p).replace('.pt', '') for p in ari_paths]
             eval_metrics = epoch_eval.evaluate(embs, ev_ids, labels)
