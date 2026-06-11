@@ -796,18 +796,10 @@ def train_contrastive(model_type='topotein', epochs=30, batch_size=16, lr=1e-4, 
         soft_supcon = False
 
     train_dataset = PCCDataset(train_files, transform=aug)
-    # Validation gets a no-jitter transform: two identical (un-noised) views of each
-    # protein. This removes the only noise source from val loss so it's a cleaner
-    # convergence signal, while keeping the same 2-view contrastive structure.
-    val_aug = StructuralAugmentations(jitter_sigma=0.0, drop_ratio_range=(0.0, 0.0),
-                                      mask_ratio=0.0, use_crop=False)
-    val_dataset = PCCDataset(val_files, transform=val_aug)
+    val_dataset = PCCDataset(val_files, transform=aug)
 
-    # Worker counts: train uses cpu//2, val uses cpu//4 (lighter; fewer batches,
-    # no hard-neg reordering overhead). Both are non-zero so loading is parallel.
+    # Optimized DataLoader: use persistent workers and conditional pin_memory (CUDA only)
     num_workers = max(1, (os.cpu_count() or 4) // 2)
-    val_workers = max(1, (os.cpu_count() or 4) // 4)
-
     train_sampler = None
     # `make_train_loader` is a FACTORY (not a single loader) so the epoch loop can cold-
     # restart the workers under memory pressure by simply building a fresh one. Each call
@@ -827,20 +819,7 @@ def train_contrastive(model_type='topotein', epochs=30, batch_size=16, lr=1e-4, 
         def make_train_loader():
             return DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=contrastive_collate, num_workers=num_workers, prefetch_factor=2, persistent_workers=False, pin_memory=DEVICE.type == 'cuda', worker_init_fn=worker_init_fn)
     train_loader = make_train_loader()  # one instance for len()/scheduler bookkeeping
-
-    # Val loader mirrors train: residue-budgeted sampler (same budget, no hard-neg
-    # reordering) + parallel workers + prefetch. This gives val the same shape
-    # stability (fewer MPS kernel recompilations) and parallel IO that train has.
-    # Using a fixed seed so val batches are deterministic across epochs.
-    val_keys = extract_batch_keys(val_files, os.path.join(CHECKPOINT_DIR, 'batch_keys_cache_val.pt'))
-    val_sampler = HardNegativeBatchSampler(val_keys, batch_size, seed=0,
-                                           max_residues=max_residues, length_jitter=0.0,
-                                           ratio_jitter=0.0)
-    val_sampler.set_epoch(0)  # fixed; val order never changes
-    val_loader = DataLoader(val_dataset, batch_sampler=val_sampler,
-                            collate_fn=contrastive_collate, num_workers=val_workers,
-                            prefetch_factor=2, pin_memory=DEVICE.type == 'cuda',
-                            worker_init_fn=worker_init_fn)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=contrastive_collate, num_workers=0, pin_memory=DEVICE.type == 'cuda')
 
     # Memory governor: caps process RSS at mem_hard_gb via off-schedule reclaim + cold
     # worker restarts + dynamic residue-budget shrink (see MemoryGovernor).
@@ -1126,8 +1105,9 @@ def _run_training_epoch(model, head, train_loader, val_loader, optimizer, schedu
     if head: head.eval()
     val_loss_epoch = 0.0
     ari_embs, ari_paths = [], []   # collect view-1 embeddings for per-epoch ARI
-    # Val now has a residue-budgeted sampler + parallel workers (same as train), so
-    # per-step shapes are bounded. Keep periodic reclaim as a safety net.
+    # Validation has no residue-budgeted sampler and (previously) no per-step reclaim, so
+    # the MPS allocator pool grew across the whole val set and spilled 16GB into swap
+    # (observed ~27GB, 44s/it). Throttle a gc+empty_cache the way the training loop does.
     val_cleanup = max(1, cleanup_every // 2) if cleanup_every > 0 else 25
     with torch.no_grad():
         for v_step, v_batch in enumerate(tqdm(val_loader, desc="Validation", leave=False)):
