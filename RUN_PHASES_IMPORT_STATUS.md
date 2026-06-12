@@ -58,7 +58,13 @@ import cluster_common as cc
 
 **Dependencies:** Import from cluster_common.py via dynamic path
 
-**Status:** ✅ All working
+**Fix Applied:** Added path injection to find cluster_common in scripts/analysis/
+```python
+sys.path.insert(0, str(Path(__file__).parent.parent / 'analysis'))
+import cluster_common as cc
+```
+
+**Status:** ✅ Fixed (commit ecbc5f7)
 
 ---
 
