@@ -15,9 +15,12 @@ Joins, one row per protein:
     python annotate_clusters.py
 """
 import os
+import sys
 import argparse
+from pathlib import Path
 from collections import defaultdict
 
+sys.path.insert(0, str(Path(__file__).parent.parent / 'analysis'))
 import cluster_common as cc
 
 
