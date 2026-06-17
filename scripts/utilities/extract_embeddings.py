@@ -28,7 +28,7 @@ import argparse
 from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
-from topotein import Topotein
+from tcpnet_adapter import Topotein
 from train import custom_collate, to_device
 from train_contrastive import pad_to_buckets, extract_batch_keys, free_memory, worker_init_fn
 

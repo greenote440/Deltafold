@@ -174,7 +174,7 @@ def load_model(model_type, task):
         from asymmetric_topotein import AsymmetricTopoNet
         model = AsymmetricTopoNet(scalar_dim=128, **model_config).to(DEVICE)
     else:
-        from topotein import Topotein
+        from tcpnet_adapter import Topotein
         model = Topotein(scalar_dim=128, **model_config).to(DEVICE)
     model.load_state_dict(ckpt['model_state_dict'])
     model.eval()

@@ -239,7 +239,7 @@ def run_profiler(model_type, task, batch_size, dataset_size=None):
         from asymmetric_topotein import AsymmetricTopoNet
         model = AsymmetricTopoNet(scalar_dim=128).to(DEVICE)
     else:
-        from topotein import Topotein
+        from tcpnet_adapter import Topotein
         model = Topotein(scalar_dim=128).to(DEVICE)
     
     model.train()
@@ -288,6 +288,7 @@ def main():
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--accum_steps', type=int, default=1)
     parser.add_argument('--dataset-size', dest='dataset_size', type=int, default=None, help="Limit the size of the training/validation set for quick checks.")
+    parser.add_argument('--downsampled', action='store_true', help="Train on the downsampled sub-dataset: the same ~3647 proteins (train+val) as the original downsampled run, reconstructed from the deterministic cluster-aware split (seed=42). Matches extract_embeddings.py --downsampled. Composable with --dataset-size for an even smaller quick check.")
     parser.add_argument('--profile', action='store_true', help="Run a short profiling session and exit.")
     parser.add_argument('--profile_train', action='store_true', help="Profile a few steps of the training loop and save the trace.")
     parser.add_argument('--cprofile', action='store_true', help="Run the entire execution through cProfile to find Python-level bottlenecks.")
@@ -304,7 +305,7 @@ def main():
     parser.add_argument('--mem-hard-gb', dest='mem_hard_gb', type=float, default=14.0, help="Hard RSS cap (GB): above this (after a reclaim attempt), cold-restart DataLoader workers and shrink the residue budget. Keeps headroom below the 16GB swap cliff. 0 disables.")
     parser.add_argument('--min-residues', dest='min_residues', type=int, default=3500, help="Floor for the dynamic residue-budget shrink under memory pressure.")
     parser.add_argument('--no-budget-adapt', dest='no_budget_adapt', action='store_true', help="Disable dynamic residue-budget shrink under memory pressure (keeps cold restarts).")
-    parser.add_argument('--split', type=str, choices=['cluster', 'phylo'], default='cluster', help="Train/val split: cluster-aware or phylogenetic by taxid (report 7).")
+    parser.add_argument('--split', type=str, choices=['cluster', 'phylo'], default='phylo', help="Train/val split: cluster-aware or phylogenetic by taxid (report 7).")
     parser.add_argument('--tm-aux-weight', dest='tm_aux_weight', type=float, default=0.0, help="Weight of the TM-score regression auxiliary loss (0=off; report 7/3.4).")
     parser.add_argument('--unsupervised', dest='unsupervised', action='store_true', help="Use plain InfoNCE instead of cluster-label SupCon (avoids taxonomic label leakage, report 4.1).")
     # --- TM-score analysis fixes (tm_score_analysis.md §5) ---
@@ -363,6 +364,7 @@ def main():
             mem_hard_gb=args.mem_hard_gb,
             min_residues=args.min_residues,
             no_budget_adapt=args.no_budget_adapt,
+            downsampled=args.downsampled,
         )
 
     if args.cprofile:

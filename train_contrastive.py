@@ -19,12 +19,16 @@ import gc
 import os
 import psutil
 
-from topotein import Topotein
+from tcpnet_adapter import Topotein
 from asymmetric_topotein import AsymmetricTopoNet
 from contrastive_engine import StructuralAugmentations, NTXentLoss
 from train import PCCDataset, custom_collate, to_device, get_cluster_aware_split, DEVICE, PROC_DIR, CHECKPOINT_DIR, CLUSTER_TSV
 
 _PROC = psutil.Process(os.getpid())
+
+# Number of train proteins in the original downsampled run. Kept in sync with
+# extract_embeddings.py so `--downsampled` here and there select the same subset.
+DOWNSAMPLED_DATASET_SIZE = 2918
 
 
 # ── macOS phys_footprint via Mach task_info ─────────────────────────────────
@@ -756,12 +760,23 @@ def train_contrastive(model_type='topotein', epochs=30, batch_size=16, lr=1e-4, 
                       tm_cache_path=None, soft_supcon=False, use_crop=False, jitter_sigma=0.3,
                       edge_attn_softmax=True, dist_bias_gamma=0.1, detach_h3=True,
                       mem_soft_gb=11.0, mem_hard_gb=14.0, min_residues=2000,
-                      no_budget_adapt=False):
+                      no_budget_adapt=False, downsampled=False):
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
     tlog = TrainingLog(os.path.join(CHECKPOINT_DIR, 'training_log.jsonl.gz'))
 
     from train import get_split
     train_files, val_files = get_split(PROC_DIR, CLUSTER_TSV, split_ratio=0.8, seed=42, split=split)
+
+    if downsampled:
+        # Restrict to the same ~3647 proteins (train+val) as the original
+        # downsampled run, reconstructed from the deterministic cluster-aware
+        # split (seed=42). Mirrors extract_embeddings.py's `_downsampled_files()`
+        # so training and embedding extraction operate on the identical subset.
+        val_size = int(DOWNSAMPLED_DATASET_SIZE * (1.0 - 0.8) / 0.8)
+        train_files = train_files[:DOWNSAMPLED_DATASET_SIZE]
+        val_files = val_files[:val_size]
+        print(f"Using downsampled sub-dataset: {len(train_files)} train, "
+              f"{len(val_files)} val proteins (seed=42 cluster split).")
 
     if dataset_size is not None:
         print(f"Limiting dataset to {dataset_size} training samples.")
@@ -1015,13 +1030,20 @@ def _run_training_epoch(model, head, train_loader, val_loader, optimizer, schedu
                     r3['protein_size'] = torch.ones_like(r3['protein_size']) * 500.0
                     r3['radius_of_gyration'] = torch.zeros_like(r3['radius_of_gyration'])
 
-            # Bucket-pad shapes so MPS reuses compiled kernels (no per-step recompile
-            # bloat). Real proteins are unchanged; slice the output back to real_B.
-            if pad_buckets:
-                model_in, real_B = pad_to_buckets(features)
+            if getattr(model, 'is_tcpnet', False):
+                # Equivariant TCPNet rebuilds geometry from the raw PDBs keyed by
+                # `paths` (the rank-dict / bucket padding don't apply here).
+                model_in = None  # bound so the end-of-step `del` works on this path
+                z = model(paths=paths)
+                real_B = z.size(0)
             else:
-                model_in, real_B = features, features['rank3']['protein_size'].shape[0]
-            z = model(model_in)
+                # Bucket-pad shapes so MPS reuses compiled kernels (no per-step recompile
+                # bloat). Real proteins are unchanged; slice the output back to real_B.
+                if pad_buckets:
+                    model_in, real_B = pad_to_buckets(features)
+                else:
+                    model_in, real_B = features, features['rank3']['protein_size'].shape[0]
+                z = model(model_in)
             if z.dim() == 1:
                 z = z.unsqueeze(0)
             z = z[:real_B]
@@ -1157,11 +1179,16 @@ def _run_training_epoch(model, head, train_loader, val_loader, optimizer, schedu
             if v_batch is None: continue
             if is_contrastive:
                 v_feat = to_device(v_batch[0], DEVICE)
-                if pad_buckets:
-                    v_in, v_realB = pad_to_buckets(v_feat)
+                if getattr(model, 'is_tcpnet', False):
+                    v_in = None  # bound so the end-of-step `del` works on this path
+                    vz = model(paths=v_batch[1])
+                    v_realB = vz.size(0)
                 else:
-                    v_in, v_realB = v_feat, v_feat['rank3']['protein_size'].shape[0]
-                vz = model(v_in)
+                    if pad_buckets:
+                        v_in, v_realB = pad_to_buckets(v_feat)
+                    else:
+                        v_in, v_realB = v_feat, v_feat['rank3']['protein_size'].shape[0]
+                    vz = model(v_in)
                 if vz.dim() == 1: vz = vz.unsqueeze(0)
                 vz = vz[:v_realB]
                 VB = vz.size(0) // 2

@@ -3,6 +3,9 @@
 *.out
 *.toc
 
+#External
+external/
+
 # Python
 __pycache__/
 *.pyc
