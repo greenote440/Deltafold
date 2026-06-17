@@ -363,13 +363,9 @@ objective alone.
 \subsection{Metrics}
 
 I evaluate the embeddings against the held-out family labels and against
-ground-truth structural similarity. I report the adjusted Rand index of $k$-means
-clusters, the adjusted Rand index of HDBSCAN (density-based) clusters
-\cite{hdbscan}, the normalised mutual information with the family labels, the
-TM-recall at $k$ (the fraction of a protein's true structural homologs that land
-among its $k$ nearest neighbours in the embedding), and TM-$\rho$ (the
-correlation between embedding distance and pairwise TM-score). I think TM-recall
-is the cleanest of these because it does not depend on a clustering algorithm.
+ground-truth structural similarity. I report the adjusted Rand index of HDBSCAN
+(density-based) clusters \cite{hdbscan} and TM-$\rho$ (the rank correlation
+between embedding distance and pairwise TM-score).
 
 The adjusted Rand index (ARI) compares the clustering of the embeddings to the
 known families, corrected for what you would get by chance, on a scale where 0 is
@@ -382,19 +378,10 @@ singletons), so the score reacts to a handful of borderline proteins changing
 cluster. This is why the HDBSCAN ARI swings more than the $k$-means one: it is
 the more sensitive of the two to small changes in the geometry.
 
-The normalised mutual information (NMI) also compares the clustering to the
-families, but instead of matching cluster assignments it asks how much knowing a
-protein's cluster tells you about its family, again on a 0 to 1 scale. It is the
-smoothest of the three, staying around 0.86 to 0.885, because it is carried
-by the many easy, well-separated clusters and is less sensitive than ARI to where
-exactly the borderline proteins fall. Its slow upward drift is the clearest hint
-of gradual improvement, but the steps are small and sit within the run-to-run
-noise, so I would not over-read it on its own.
-
 TM-$\rho$ is different in kind: it is a rank correlation between distance in the
 embedding and the TM-score (a standard measure of structural similarity) over a
 sample of protein pairs. Because it does not involve any clustering, it is the
-most stable of the three, sitting between about $-0.75$ and $-0.80$ across every
+most stable of the two, sitting between about $-0.75$ and $-0.80$ across every
 epoch. A negative value is what we want, since structurally similar proteins
 (high TM-score) should end up close together (small distance). The small wobble
 comes mostly from a different set of pairs being sampled each epoch rather than
@@ -437,12 +424,25 @@ words the contrastive objective is essentially solved within the first epoch.
 What is more interesting is that the evaluation metrics keep improving a little
 even after the loss has flattened. Pushing the run from epoch 6 to epoch 20 still
 buys a small but consistent gain in clustering quality: the HDBSCAN ARI rises from
-about 0.25 to about 0.40 and the NMI from about 0.87 to 0.89, while TM-$\rho$
-decreases (becomes more negative), which means a stronger and therefore better
-anti-correlation between embedding distance and structural similarity. So the
-embedding geometry is still being refined after the loss plateaus, even though the
-gains are modest and noisy from epoch to epoch. Table~\ref{tab:results} lists the
-values at the start of training, at epoch 6, and at epoch 20.
+about 0.25 to about 0.40, while TM-$\rho$ decreases (becomes more negative), which
+means a stronger and therefore better anti-correlation between embedding distance
+and structural similarity. So the embedding geometry is still being refined after
+the loss plateaus, even though the gains are modest and noisy from epoch to
+epoch. Table~\ref{tab:results} lists the values at the start of training, at
+epoch 6, and at epoch 20.
+
+The TM-$\rho$ column starts surprisingly negative ($-0.68$) even with completely
+random weights, rather than near 0 as you might expect from an untrained model.
+I checked this is not a bug (shuffling the embedding-to-protein correspondence
+collapses it to $\approx 0$, as it should), so the correlation is real even
+before any training happens. The likely explanation is that the model takes
+the Foldseek 3Di structural alphabet as an input feature, and 3Di tokens are
+themselves derived from local structure, so they are highly informative about
+TM-score by construction; the early layers (linear $\to$ layer norm $\to$
+SiLU $\to$ linear) are mostly information-preserving, so a random forward pass
+still lets a lot of that structural signal leak straight through into the
+embedding distances. Training then sharpens this further, from $-0.68$ to about
+$-0.79$.
 
 \begin{table}[h]
 \centering
@@ -452,17 +452,18 @@ Metric & Initial & Epoch 6 & Epoch 20\\
 \midrule
 Training loss   & $\approx 2.5$ & 0.53    & 0.43\\
 Validation loss & ---           & 0.41    & 0.38\\
-ARI (HDBSCAN)   & 0.16          & 0.25    & 0.40\\
-NMI (HDBSCAN)   & 0.86          & 0.87    & 0.89\\
-TM-$\rho$       & $-0.75$       & $-0.79$ & $-0.78$\\
+ARI (HDBSCAN)   & 0.03          & 0.25    & 0.40\\
+TM-$\rho$       & $-0.68$       & $-0.79$ & $-0.78$\\
 \bottomrule
 \end{tabular}
-\caption{Preliminary results from a single run. ``Initial'' is the start of
-training for the losses and the first full-scale evaluation (epoch 5) for the
-clustering metrics; the earlier epochs were scored on a small development subset
-that is not comparable and are omitted, and the validation loss is only recorded
-from epoch 6. The training loss is essentially converged by epoch 6, yet the
-clustering metrics continue to improve slightly through epoch 20.}
+\caption{Preliminary results from a single run. ``Initial'' is a freshly
+initialized model with random weights (no training), scored on the same
+validation split as the later epochs; the validation loss is only recorded
+from epoch 6 since random weights have no meaningful loss to report on that
+scale. The training loss is essentially converged by epoch 6, yet the
+clustering metrics continue to improve slightly through epoch 20, and both
+clustering metrics show training pulls the embeddings well past the
+random-weight baseline.}
 \label{tab:results}
 \end{table}
 

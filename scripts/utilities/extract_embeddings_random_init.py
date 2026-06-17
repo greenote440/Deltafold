@@ -4,12 +4,14 @@ loaded) so we have a true epoch-0 baseline for Table 1 of deltafold_protocol.tex
 Mirrors extract_embeddings.py exactly except it skips the checkpoint load.
 """
 import sys
+import argparse
 from pathlib import Path
 import torch
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from extract_embeddings import (
     ExtractionDataset, collate_with_names, LengthBudgetSampler, DEVICE, PROC_DIR,
+    _downsampled_files,
 )
 from train_contrastive import pad_to_buckets, extract_batch_keys, free_memory, worker_init_fn
 from train import to_device
@@ -29,10 +31,20 @@ CHECKPOINT_DIR = './checkpoints'
 
 
 def main():
-    dataset = ExtractionDataset(PROC_DIR)
+    parser = argparse.ArgumentParser(description="Extract embeddings from a randomly initialised model (no checkpoint).")
+    parser.add_argument('--downsampled', action='store_true', help="Only extract the ~3647 proteins from the downsampled training split (same deterministic set as --downsampled in extract_embeddings.py).")
+    parser.add_argument('--out', type=str, default=None, help="Output path for the embeddings .pt file (default: data/virome_embeddings_random_init.pt).")
+    args = parser.parse_args()
+
+    files = _downsampled_files() if args.downsampled else None
+    dataset = ExtractionDataset(PROC_DIR, files=files)
+    out_file = args.out or OUTPUT_FILE
+    if args.downsampled:
+        print(f"Downsampled mode: {len(dataset)} proteins")
+
     keys_cache = os.path.join(CHECKPOINT_DIR, 'batch_keys_cache.pt')
     sizes = [k[0] for k in extract_batch_keys(dataset.files, keys_cache)]
-    sampler = LengthBudgetSampler(sizes, batch_size=32, max_residues=8000)
+    sampler = LengthBudgetSampler(sizes, batch_size=64, max_residues=24000)
     print(f"{len(sampler)} batches over {len(dataset)} proteins")
 
     num_workers = max(1, (os.cpu_count() or 4) // 2)
@@ -65,8 +77,8 @@ def main():
 
     free_memory()
     print(f"\nExtracted embeddings for {len(embeddings_dict)} proteins.")
-    torch.save(embeddings_dict, OUTPUT_FILE)
-    print(f"Saved to {OUTPUT_FILE}")
+    torch.save(embeddings_dict, out_file)
+    print(f"Saved to {out_file}")
 
 
 if __name__ == "__main__":

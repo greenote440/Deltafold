@@ -37,12 +37,26 @@ PROC_DIR = './data/hoan_processed'
 CHECKPOINT_DIR = './checkpoints'
 OUTPUT_FILE = './data/virome_embeddings.pt'
 
+CLUSTER_TSV = './data/cluster.tsv'
+DOWNSAMPLED_DATASET_SIZE = 2918  # train proteins used in the original downsampled run
+
+
+def _downsampled_files():
+    """Return the same ~3647 files (train+val) used for the downsampled training run,
+    reconstructed deterministically from the cluster-aware split (seed=42)."""
+    from train import get_cluster_aware_split
+    train_files, val_files = get_cluster_aware_split(
+        PROC_DIR, CLUSTER_TSV, split_ratio=0.8, seed=42)
+    val_size = int(DOWNSAMPLED_DATASET_SIZE * (1.0 - 0.8) / 0.8)
+    return train_files[:DOWNSAMPLED_DATASET_SIZE] + val_files[:val_size]
+
+
 class ExtractionDataset(Dataset):
     """
     Dataset that returns both the protein ID (filename) and the PCC features.
     """
-    def __init__(self, data_dir):
-        self.files = sorted(glob.glob(os.path.join(data_dir, '*.pt')))
+    def __init__(self, data_dir, files=None):
+        self.files = files if files is not None else sorted(glob.glob(os.path.join(data_dir, '*.pt')))
 
     def __len__(self):
         return len(self.files)
@@ -104,8 +118,12 @@ class LengthBudgetSampler(Sampler):
 
 
 def extract_embeddings(model_type='topotein', task='contrastive', batch_size=32,
-                       max_residues=8000, cleanup_every=50, pad_buckets=True):
-    dataset = ExtractionDataset(PROC_DIR)
+                       max_residues=8000, cleanup_every=50, pad_buckets=True,
+                       checkpoint=None, output=None, downsampled=False):
+    files = _downsampled_files() if downsampled else None
+    dataset = ExtractionDataset(PROC_DIR, files=files)
+    if downsampled:
+        print(f"Downsampled mode: {len(dataset)} proteins")
     if len(dataset) == 0:
         print(f"No .pt files found in {PROC_DIR}.")
         return
@@ -124,11 +142,13 @@ def extract_embeddings(model_type='topotein', task='contrastive', batch_size=32,
                             num_workers=num_workers, prefetch_factor=1, persistent_workers=False,
                             pin_memory=DEVICE.type == 'cuda', worker_init_fn=worker_init_fn)
 
+    out_file = output or OUTPUT_FILE
+
     best_ckpt_path = os.path.join(CHECKPOINT_DIR, f'checkpoint_{task}_{model_type}_best.pth')
 
     # Fallback for legacy checkpoint names if the new best_ckpt_path doesn't exist
-    best_ckpt = None
-    if not os.path.exists(best_ckpt_path):
+    best_ckpt = checkpoint or None
+    if best_ckpt is None and not os.path.exists(best_ckpt_path):
         checkpoint_files = glob.glob(os.path.join(CHECKPOINT_DIR, 'checkpoint_ep*.pth'))
         if not checkpoint_files:
             print(f"No checkpoints found in {CHECKPOINT_DIR}. Train the model first.")
@@ -140,7 +160,7 @@ def extract_embeddings(model_type='topotein', task='contrastive', batch_size=32,
             if ckpt.get('loss', float('inf')) < best_loss:
                 best_loss = ckpt['loss']
                 best_ckpt = f
-    else:
+    elif best_ckpt is None:
         best_ckpt = best_ckpt_path
 
     print(f"Loading checkpoint: {best_ckpt}")
@@ -197,20 +217,24 @@ def extract_embeddings(model_type='topotein', task='contrastive', batch_size=32,
 
     free_memory()
     print(f"\nExtracted embeddings for {len(embeddings_dict)} proteins.")
-    torch.save(embeddings_dict, OUTPUT_FILE)
-    print(f"Embeddings successfully saved to {OUTPUT_FILE}")
+    torch.save(embeddings_dict, out_file)
+    print(f"Embeddings successfully saved to {out_file}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Deltafold Embedding Extraction")
     parser.add_argument('--model', type=str, choices=['topotein', 'asymmetric'], default='topotein')
     parser.add_argument('--task', type=str, choices=['mtm', 'contrastive'], default='contrastive')
-    parser.add_argument('--batch_size', type=int, default=32, help="Hard upper bound on proteins per batch (the residue budget usually binds first).")
-    parser.add_argument('--max-residues', dest='max_residues', type=int, default=8000, help="Cap residues per batch. Forward-only, so this maps ~directly to in-forward residues; safe above training's 4000 (which sees ~1.75x after 2 views + backward). Keeps batches off the MPS swap cliff.")
+    parser.add_argument('--batch_size', type=int, default=64, help="Hard upper bound on proteins per batch (the residue budget usually binds first).")
+    parser.add_argument('--max-residues', dest='max_residues', type=int, default=16000, help="Cap residues per batch. Forward-only, so this maps ~directly to in-forward residues; safe above training's 4000 (which sees ~1.75x after 2 views + backward). Keeps batches off the MPS swap cliff.")
     parser.add_argument('--cleanup-every', dest='cleanup_every', type=int, default=50, help="Run MPS gc/empty_cache every N steps (0 disables). Throttled because doing it every step forces costly pool reallocation on MPS.")
     parser.add_argument('--no-pad-buckets', dest='pad_buckets', action='store_false', help="Disable bucket-padding of batch shapes (only for debugging; padding avoids per-step slowdown from MPS kernel-cache bloat).")
+    parser.add_argument('--emb', dest='checkpoint', type=str, default=None, help="Path to a specific checkpoint .pth file to load (overrides the default best-checkpoint lookup).")
+    parser.add_argument('--out', type=str, default=None, help="Output path for the embeddings .pt file (default: data/virome_embeddings.pt).")
+    parser.add_argument('--downsampled', action='store_true', help=f"Only extract the {DOWNSAMPLED_DATASET_SIZE + int(DOWNSAMPLED_DATASET_SIZE * 0.25)} proteins used in the downsampled training run (reconstructed from the same deterministic cluster-aware split, seed=42).")
 
     args = parser.parse_args()
 
     extract_embeddings(model_type=args.model, task=args.task, batch_size=args.batch_size,
                        max_residues=args.max_residues, cleanup_every=args.cleanup_every,
-                       pad_buckets=args.pad_buckets)
+                       pad_buckets=args.pad_buckets, checkpoint=args.checkpoint,
+                       output=args.out, downsampled=args.downsampled)
