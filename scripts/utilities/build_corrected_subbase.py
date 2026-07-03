@@ -33,7 +33,12 @@ import json
 import os
 import random
 import re
+import sys
 from collections import Counter, defaultdict
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+import deltafold_paths
 
 NOMBURG_TSV = "./code_and_intermediate_data/intermediate_data/merged_clusters.tax.tsv"
 
@@ -64,11 +69,15 @@ def load_nomburg_clusters(path):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--proc-dir", default="./data/hoan_processed",
-                    help="Directory containing featurised .pt files.")
+    ap.add_argument("--deltafold", action="store_true",
+                    help="Use the box data root (/data/pnardi) for --proc-dir/--out-prefix "
+                         "defaults; already applied at import. Equivalent to DELTAFOLD_DATA_DIR=/data/pnardi.")
+    ap.add_argument("--proc-dir", default=deltafold_paths.PROC_DIR,
+                    help="Directory containing featurised .pt files "
+                         "(default follows the data root: ./data or /data/pnardi under --deltafold).")
     ap.add_argument("--nomburg-tsv", default=NOMBURG_TSV,
                     help="Path to merged_clusters.tax.tsv from the Nomburg study.")
-    ap.add_argument("--out-prefix", default="./data/subbase_corrected",
+    ap.add_argument("--out-prefix", default=deltafold_paths.SUBBASE_PREFIX,
                     help="Output path prefix for _train.txt, _val.txt, _stats.json.")
     ap.add_argument("--n-clusters", type=int, default=500,
                     help="Number of Nomburg clusters to select (default 500). "

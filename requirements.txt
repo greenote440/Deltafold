@@ -1,0 +1,37 @@
+# DeltaFold — Python dependencies
+#
+# Install with:  pip install -r requirements.txt
+# Versions are floors (tested on the versions in comments). See README.md.
+#
+# PyTorch note: this file pins only a floor for `torch`. Install the build that
+# matches your hardware BEFORE / instead of the line below:
+#   - deltafold box (CUDA 12.2, L40S):  pip install torch --index-url https://download.pytorch.org/whl/cu121
+#   - macOS (Apple Silicon, MPS) / CPU:  pip install torch      (default wheel)
+
+# --- Core numerics / deep learning ---
+torch>=2.1                 # tested 2.7.1  (MPS on macOS, CUDA on the deltafold box)
+numpy>=1.24,<2             # tested 1.26.4
+scipy>=1.11                # tested 1.17.1
+scikit-learn>=1.3          # tested 1.9.0  (metrics, PCA/whitening, agglomerative clustering)
+
+# --- Protein structure I/O & similarity ---
+biotite>=0.40              # tested 1.4.0  (PDB parsing + DSSP-style SSE assignment in the lifter)
+biopython>=1.81            # tested 1.87
+tmtools>=0.2               # tested 0.3.0  (TM-score alignment: TM-rho eval + TM cache)
+
+# --- Embedding clustering & evaluation ---
+hdbscan>=0.8.33            # tested 0.8.44 (density clustering of the learned embeddings)
+umap-learn>=0.5.4          # tested 0.5.12 (UMAP projections for visual inspection)
+
+# --- Data wrangling / plotting / runtime utilities ---
+pandas>=2.0                # tested 3.0.3
+matplotlib>=3.7            # tested 3.10.9
+plotly>=5.18               # tested 6.6.0  (interactive embedding plots)
+networkx>=3.1              # tested 3.6.1  (cluster / bridge graph analysis)
+tqdm>=4.65                 # tested 4.67.3
+psutil>=5.9                # tested 7.2.2  (memory governor)
+requests>=2.31             # tested 2.34.2 (dataset download)
+
+# --- Optional (only used by a few analysis / test scripts) ---
+# ete3>=3.1                # phylogenetic annotation (scripts/utilities/annotate_clusters.py)
+# pytest>=7.4              # running the test_*.py / validate_*.py checks

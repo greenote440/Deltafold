@@ -28,16 +28,17 @@ import argparse
 from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+import deltafold_paths
 from topotein import Topotein
 from train import custom_collate, to_device
 from train_contrastive import pad_to_buckets, extract_batch_keys, free_memory, worker_init_fn
 
 DEVICE = torch.device('mps' if torch.backends.mps.is_available() else ('cuda' if torch.cuda.is_available() else 'cpu'))
-PROC_DIR = './data/hoan_processed'
+# Data root from deltafold_paths: ./data locally, /data/pnardi under --deltafold.
+PROC_DIR = deltafold_paths.PROC_DIR
 CHECKPOINT_DIR = './checkpoints'
-OUTPUT_FILE = './data/virome_embeddings.pt'
-
-CLUSTER_TSV = './data/cluster.tsv'
+OUTPUT_FILE = deltafold_paths.EMB_FILE
+CLUSTER_TSV = deltafold_paths.CLUSTER_TSV
 DOWNSAMPLED_DATASET_SIZE = 2918  # train proteins used in the original downsampled run
 
 
@@ -236,6 +237,9 @@ def extract_embeddings(model_type='topotein', task='contrastive', batch_size=32,
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Deltafold Embedding Extraction")
+    parser.add_argument('--deltafold', action='store_true',
+                        help="Use the box data root (/data/pnardi) for inputs/outputs; already "
+                             "applied at import. Equivalent to DELTAFOLD_DATA_DIR=/data/pnardi.")
     parser.add_argument('--model', type=str, choices=['topotein', 'asymmetric', 'equivariant'], default='topotein')
     parser.add_argument('--task', type=str, choices=['mtm', 'contrastive'], default='contrastive')
     parser.add_argument('--batch_size', type=int, default=64, help="Hard upper bound on proteins per batch (the residue budget usually binds first).")

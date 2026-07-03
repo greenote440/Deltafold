@@ -17,11 +17,8 @@ from torch.utils.data import Dataset, DataLoader
 from contrastive_engine import StructuralAugmentations
 
 
-def _deltafold_requested():
-    """True when this run targets the CUDA `deltafold` box (1x L40S, Xeon, 1TB RAM).
-    Detected from argv/env at import time so DEVICE is resolved to CUDA *before*
-    anything binds it — the `--deltafold` flag itself is parsed later in main()."""
-    return ('--deltafold' in sys.argv) or (os.environ.get('DELTAFOLD_DEVICE') == 'cuda')
+from deltafold_paths import deltafold_requested as _deltafold_requested
+from deltafold_paths import DATA_DIR, PROC_DIR, CLUSTER_TSV, SUBBASE_PREFIX
 
 
 def _resolve_device():
@@ -39,12 +36,12 @@ def _resolve_device():
 
 
 DEVICE = _resolve_device()
-PROC_DIR = './data/hoan_processed'
+# PROC_DIR / CLUSTER_TSV / DATA_DIR come from deltafold_paths (imported above): they
+# point at ./data locally and at /data/pnardi under --deltafold on the box.
 # Overridable per-run (e.g. by the overnight ablation sweep) so each config's
 # checkpoints / training_log / epoch_eval land in their own directory and don't
 # collide. Resolved at import time from the env, before train_contrastive binds it.
 CHECKPOINT_DIR = os.environ.get('DELTAFOLD_CKPT_DIR', './checkpoints')
-CLUSTER_TSV = './data/cluster.tsv'
 
 class PCCDataset(Dataset):
     def __init__(self, file_list, transform=None):
@@ -250,7 +247,7 @@ def get_phylogenetic_split(data_dir, split_ratio=0.8, seed=42, level='taxid'):
     return train_files, val_files
 
 
-def get_corrected_split(prefix='./data/subbase_corrected'):
+def get_corrected_split(prefix=SUBBASE_PREFIX):
     """Loads the corrected prototyping sub-base (plan_experimentation_v2 §4) from
     the manifests written by ``scripts/utilities/build_corrected_subbase.py``.
 

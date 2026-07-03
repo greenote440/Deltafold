@@ -14,13 +14,18 @@ import biotite.structure.io.pdb as pdb
 import torch
 import multiprocessing as mp
 
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+import deltafold_paths
+
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 
 DEVICE = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
-BASE_DIR = Path('./data')
-RAW_ZIP = BASE_DIR / 'hoan_raw_pdb' / 'virome_pdbs.zip'
+# Data root from deltafold_paths: ./data locally, /data/pnardi under --deltafold.
+BASE_DIR = Path(deltafold_paths.DATA_DIR)
+RAW_ZIP = Path(deltafold_paths.RAW_ZIP)
 REFINED_LIST = BASE_DIR / 'subdataset_files_refined.txt'
-PROC_DIR = BASE_DIR / 'hoan_processed'
+PROC_DIR = Path(deltafold_paths.PROC_DIR)
 PROC_DIR.mkdir(parents=True, exist_ok=True)
 
 AA_ALPHABET = "ACDEFGHIKLMNPQRSTVWYUO" # 22 + Unknown (X) = 23
@@ -515,6 +520,9 @@ def collect_paths(downsampled, max_protein):
 def main():
     ap = argparse.ArgumentParser(
         description="Topotein lifting pipeline: PDB -> hierarchical .pt features.")
+    ap.add_argument('--deltafold', action='store_true',
+                    help="Use the box data root (/data/pnardi); already applied to the "
+                         "in/out paths at import. Equivalent to DELTAFOLD_DATA_DIR=/data/pnardi.")
     ap.add_argument('--downsampled', action='store_true',
                     help="Lift only the refined downsampled subset (subdataset_files_refined.txt). "
                          "Default: lift the whole archive (~67,715 PDBs).")
