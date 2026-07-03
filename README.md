@@ -59,14 +59,19 @@ python scripts/utilities/download_dataset.py
 python scripts/utilities/topotein_lifter.py --workers 16
 #    (add --downsampled for a small prototyping subset; --skip-existing to resume)
 
-# 3. Build the leakage-controlled train/val split (cold Foldseek-cluster split,
-#    exact-sequence dedup, size-distribution preserving). Writes
-#    data/subbase_corrected_{train,val}.txt (+ held-out controls).
+# 3. (optional) Build a SMALL prototyping sub-base (~4k proteins) for quick runs:
+#    cold Foldseek-cluster split, exact-sequence dedup, size-distribution preserving.
+#    Writes data/subbase_corrected_{train,val}.txt. Not needed for a full run.
 python scripts/utilities/build_corrected_subbase.py
 ```
 
-Family labels (`data/cluster.tsv`, Foldseek clusters) are used **only for
-evaluation**, never during training.
+Training defaults to the **full lifted dataset** with a cold cluster split
+(`--split cluster`) built from the **Nomburg merged clusters**
+(`code_and_intermediate_data/intermediate_data/merged_clusters.tax.tsv`): whole
+clusters go entirely to train or val, so no structural cluster spans the split.
+Make sure that file is present (it is gitignored — copy it to the box manually).
+Cluster/family labels are used **only** to define the split and for evaluation,
+never as a training signal.
 
 ---
 
@@ -76,8 +81,10 @@ The entry point is [`train.py`](train.py). The Topotein encoder is
 `--model topotein`; training is contrastive by default.
 
 ```bash
+# full dataset, cold Foldseek-cluster split (the default):
 python train.py --model topotein --task contrastive \
-    --split corrected --epochs 50 --unsupervised --temperature 0.2
+    --epochs 50 --unsupervised --temperature 0.2
+# ...or --split corrected for a quick ~4k-protein prototyping run.
 ```
 
 ### On the deltafold CUDA box
@@ -88,7 +95,7 @@ disables the macOS-oriented RAM governor):
 
 ```bash
 python train.py --model topotein --deltafold \
-    --split corrected --epochs 50 --unsupervised --temperature 0.2
+    --epochs 50 --unsupervised --temperature 0.2
 ```
 
 Any knob you pass explicitly still wins over the preset (e.g. `--max-residues`,
@@ -104,7 +111,7 @@ Any knob you pass explicitly still wins over the preset (e.g. `--max-residues`,
 | `--readout {node,protein}` | Graph readout: node pooling (default) or the rank-3 protein cell. |
 | `--scalarize {frame,norm}` | `frame` = edge-centric SE(3)+chiral (default); `norm` = O(3), reflection-blind (ablation). |
 | `--vector-dim`, `--num-layers` | Vector width `d_v` (default 16) and interaction depth `L` (default 4). |
-| `--split {corrected,cluster,phylo}` | Train/val split strategy. `corrected` is recommended (see step 2). |
+| `--split {cluster,phylo,corrected}` | Train/val split. **`cluster`** (default) = cold cluster split over the full dataset using the Nomburg merged clusters (`merged_clusters.tax.tsv`); `phylo` = cold taxonomic split; `corrected` = the ~4k subsampled prototyping base (step 2). |
 | `--objective {infonce,moco}` | Contrastive objective. `moco` adds a momentum queue for more negatives. |
 | `--sub-f-lo/--sub-f-hi`, `--sub-mode` | Substructure positive-pair size fraction and sampling mode. |
 | `--deltafold`, `--num-workers` | CUDA hardware preset (above) and DataLoader worker count. |

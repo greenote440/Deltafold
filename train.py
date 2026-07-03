@@ -42,6 +42,31 @@ DEVICE = _resolve_device()
 # checkpoints / training_log / epoch_eval land in their own directory and don't
 # collide. Resolved at import time from the env, before train_contrastive binds it.
 CHECKPOINT_DIR = os.environ.get('DELTAFOLD_CKPT_DIR', './checkpoints')
+# Nomburg merged structural clusters (the reference Foldseek clustering) — repo-relative
+# and gitignored, same path the analysis scripts use. Drives the --split cluster split.
+NOMBURG_CLUSTERS_TSV = './code_and_intermediate_data/intermediate_data/merged_clusters.tax.tsv'
+
+
+def load_nomburg_clusters(path=NOMBURG_CLUSTERS_TSV):
+    """Map protein id (the .pt filename stem = the `cluster_member` column) -> Nomburg
+    merged cluster ID. Columns (0-indexed): cluster_ID, cluster_rep, subcluster_rep,
+    cluster_member, ...; the first two rows are headers. Returns {} if the file is absent."""
+    member_to_cluster = {}
+    if not os.path.exists(path):
+        return member_to_cluster
+    with open(path) as f:
+        for i, line in enumerate(f):
+            if i < 2:                       # two header rows
+                continue
+            cols = line.rstrip('\n').split('\t')
+            if len(cols) < 4:
+                continue
+            member = cols[3]
+            if member.endswith('.pt') or member.endswith('.pdb'):
+                member = member.rsplit('.', 1)[0]
+            member_to_cluster[member] = cols[0]
+    return member_to_cluster
+
 
 class PCCDataset(Dataset):
     def __init__(self, file_list, transform=None):
@@ -182,25 +207,31 @@ def extract_accession(text):
     match = re.search(r'([A-Z]{1,2}_[0-9]{5,10})', text)
     return match.group(1) if match else text
 
-def get_cluster_aware_split(data_dir, cluster_tsv_path, split_ratio=0.8, seed=42):
-    """Splits data such that members of the same cluster stay in the same split."""
-    acc_to_cluster = {}
-    if os.path.exists(cluster_tsv_path):
-        with open(cluster_tsv_path, 'r') as f:
-            for line in f:
-                parts = line.strip().split('\t')
-                if len(parts) >= 2:
-                    rep = extract_accession(parts[0])
-                    member = extract_accession(parts[1])
-                    acc_to_cluster[member] = rep
-    
+def get_cluster_aware_split(data_dir, cluster_tsv_path=None, split_ratio=0.8, seed=42):
+    """Cold cluster split on the Nomburg merged clusters: whole clusters are assigned
+    entirely to train OR val, so no structural cluster (hence no group of near-duplicate
+    folds) spans the two sets. Each .pt is matched to its cluster by its filename stem
+    (the `cluster_member` column); unmatched files become their own singleton cluster.
+
+    (``cluster_tsv_path`` is retained for signature compatibility with existing callers
+    but is unused — the split source is now NOMBURG_CLUSTERS_TSV.)"""
+    member_to_cluster = load_nomburg_clusters()
+    if not member_to_cluster:
+        # Without the reference clusters every protein becomes its own cluster, so the
+        # "cold cluster" split silently degrades to a random per-protein 80/20 split
+        # (no leakage control). Warn loudly rather than fail.
+        print(f"[WARNING] Nomburg clusters not found at {NOMBURG_CLUSTERS_TSV}: --split "
+              f"cluster falls back to a RANDOM per-protein split (NO leakage control). "
+              f"Upload merged_clusters.tax.tsv or use --split phylo for a cold taxonomic split.")
+
     pt_files = glob.glob(os.path.join(data_dir, '*.pt'))
     cluster_groups = defaultdict(list)
     for f in pt_files:
-        acc = extract_accession(os.path.basename(f))
-        cluster_id = acc_to_cluster.get(acc, acc) # Singletons use their own accession
+        stem = os.path.basename(f)
+        stem = stem[:-3] if stem.endswith('.pt') else stem
+        cluster_id = member_to_cluster.get(stem, stem)  # unmatched -> own singleton
         cluster_groups[cluster_id].append(f)
-    
+
     cluster_ids = sorted(list(cluster_groups.keys()))
     random.seed(seed)
     random.shuffle(cluster_ids)
@@ -418,7 +449,7 @@ def main():
     parser.add_argument('--mem-hard-gb', dest='mem_hard_gb', type=float, default=14.0, help="Hard RSS cap (GB): above this (after a reclaim attempt), cold-restart DataLoader workers and shrink the residue budget. Keeps headroom below the 16GB swap cliff. 0 disables.")
     parser.add_argument('--min-residues', dest='min_residues', type=int, default=3000, help="Floor for the dynamic residue-budget shrink under memory pressure. Default is model-aware (~1200 for topotein/tcpnet, ~3500 for asymmetric).")
     parser.add_argument('--no-budget-adapt', dest='no_budget_adapt', action='store_true', help="Disable dynamic residue-budget shrink under memory pressure (keeps cold restarts).")
-    parser.add_argument('--split', type=str, choices=['cluster', 'phylo', 'corrected'], default='phylo', help="Train/val split: cluster-aware, phylogenetic by taxid (report 7), or 'corrected' = the bias-corrected prototyping sub-base from scripts/utilities/build_corrected_subbase.py (plan v2 §4; reads data/subbase_corrected_{train,val}.txt). Use without --downsampled.")
+    parser.add_argument('--split', type=str, choices=['cluster', 'phylo', 'corrected'], default='cluster', help="Train/val split. DEFAULT 'cluster' = cold cluster split over the FULL lifted dataset using the Nomburg merged clusters (needs code_and_intermediate_data/intermediate_data/merged_clusters.tax.tsv; the full-scale version of the protocol split). 'phylo' = phylogenetic cold split by taxid (report 7). 'corrected' = the SUBSAMPLED bias-corrected prototyping sub-base (~4k proteins) from build_corrected_subbase.py — use for quick prototyping, not full runs.")
     parser.add_argument('--tm-aux-weight', dest='tm_aux_weight', type=float, default=0.0, help="Weight of the TM-score regression auxiliary loss (0=off; report 7/3.4).")
     parser.add_argument('--unsupervised', dest='unsupervised', action='store_true', help="Use plain InfoNCE instead of cluster-label SupCon (avoids taxonomic label leakage, report 4.1).")
     # --- TM-score analysis fixes (tm_score_analysis.md §5) ---
