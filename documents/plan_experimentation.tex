@@ -1,0 +1,208 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[margin=2.4cm]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\hypersetup{colorlinks=true,linkcolor=black,citecolor=black,urlcolor=blue!50!black}
+
+\setlength{\parskip}{5pt}
+\setlength{\parindent}{0pt}
+
+\title{DeltaFold --- Plan d'expérimentation (état actuel)\\[2pt]
+\large Clustering structural non supervisé du virome par apprentissage topologique}
+\author{Matthieu Nardi --- stage M2}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{center}
+\fbox{\parbox{0.92\linewidth}{\small
+Document de travail. Il fixe les \emph{questions} auxquelles la prochaine campagne
+doit répondre, puis le dispositif (données, objectif, architecture, métriques,
+témoins, portes de décision) conçu pour y répondre. Il fait suite au post-mortem de
+la première run, qui n'apprenait rien au-delà du signal des features.}}
+\end{center}
+
+\tableofcontents
+\vspace{4pt}
+\hrule
+
+\section{But et cadrage}
+
+\paragraph{But scientifique.} Reproduire, puis si possible étendre, l'étude de
+Nomburg et al.\ (2024) sur le virome : recouvrer une organisation structurale des
+protéines virales et, à terme, proposer de nouveaux analogues structuraux pour les
+protéines « sombres » (sans homologue connu). L'outil est un encodeur structural
+appris sur le complexe combinatoire de la protéine (hiérarchie
+résidu $\to$ élément de structure secondaire $\to$ protéine).
+
+\paragraph{Décisions actées.}
+\begin{itemize}[leftmargin=1.4em,itemsep=2pt]
+  \item \textbf{Non supervisé pur} : on retire le contrastif supervisé (positifs
+        « même cluster Foldseek ») et le terme auxiliaire TM-score, pour éliminer
+        toute fuite côté entraînement.
+  \item \textbf{Architecture équivariante} (SE(3)), de type perceptron géométrique,
+        consommant les vecteurs de déplacement C$\alpha$ et non plus seulement des
+        scalaires invariants.
+  \item \textbf{Objectif refondu} (voir §\ref{sec:dispositif}) : positifs par
+        sous-structures, file de négatifs, tête de projection.
+  \item \textbf{Base de prototypage corrigée} : représentative (avec singletons,
+        distribution de tailles préservée), à distinguer du jeu complet.
+\end{itemize}
+
+\section{Les questions auxquelles le plan doit répondre}
+\label{sec:questions}
+
+\begin{description}[leftmargin=0pt,itemsep=4pt]
+  \item[\textbf{Q1 --- Apport de la hiérarchie topologique.}] Les complexes
+        combinatoires (hiérarchie résidu/SSE/protéine) encodent-ils quelque chose que
+        les recherches structurales actuelles (Foldseek, embeddings globaux) ne
+        capturent pas, en particulier l'\emph{homologie partielle / de domaine} ?
+  \item[\textbf{Q2 --- Objectif et création des paires.}] Quelle stratégie de
+        positifs et quel objectif permettent un \emph{apprentissage réel}, alors que
+        la première run dégradait le signal des features au fil de l'entraînement ?
+  \item[\textbf{Q3 --- Collapse.}] Comment éviter l'effondrement de la
+        représentation observé en première run (sur les configurations à négatifs
+        durs) ?
+  \item[\textbf{Q4 --- Circularité de l'évaluation.}] Comment évaluer la qualité sans
+        circularité vis-à-vis de Foldseek (qui est à la fois l'outil à battre et la
+        « vérité terrain ») ?
+  \item[\textbf{Q5 --- Géométrie : invariance vs équivariance.}] L'équivariance et la
+        complétude géométrique apportent-elles, par rapport à un encodeur invariant
+        scalaire ?
+  \item[\textbf{Q6 --- Représentativité des données.}] La base de prototypage est-elle
+        représentative, et les résultats transfèrent-ils au jeu complet ?
+  \item[\textbf{Q7 --- Découverte (Nomburg).}] Peut-on retrouver les résultats de
+        Nomburg et proposer de nouveaux analogues dans la fraction « sombre » ?
+\end{description}
+
+\section{Post-mortem de la première run (motivation)}
+
+Sur la base de prototypage, un balayage d'ablations a montré que, pour presque toutes
+les configurations, le meilleur TM-$\rho$ est atteint à l'epoch 1--2 puis se
+\emph{dégrade}, pendant que la perte de validation baisse, et \emph{aucune}
+configuration ne bat la baseline à poids aléatoires. Les runs « features/géométrie
+seules » sont parmi les meilleurs. Diagnostic : l'entraînement contrastif ne fait pas
+qu'échouer à apprendre, il \emph{détruit} le signal structural présent dans les
+features d'entrée. Causes principales identifiées dans la revue de littérature :
+\begin{enumerate}[leftmargin=1.5em,itemsep=2pt]
+  \item \textbf{Positifs triviaux} : deux vues jitter/masquage de la protéine entière
+        sont quasi identiques (perte par batch $\sim 10^{-5}$) ; le modèle apprend une
+        invariance au bruit sans rapport avec la similarité de fold.
+  \item \textbf{Négatifs durs $\to$ faux négatifs et collapse} : les quatre runs en
+        collapse utilisent tous le \emph{hard-negative mining} ; tous les runs sans
+        négatifs durs l'évitent et obtiennent les meilleurs scores.
+  \item \textbf{Architecture en aval du goulot} : un encodeur plus expressif ne peut
+        rien extraire d'un signal d'entraînement dégénéré.
+\end{enumerate}
+
+\section{Dispositif expérimental}
+\label{sec:dispositif}
+
+\subsection{Données}
+Base de prototypage \emph{corrigée} ($\sim 3$--$5$k protéines) : conserver une part
+de singletons, préserver la distribution des tailles de clusters (échantillonnage
+proportionnel, pas « 2 par cluster »), retirer la sélection par mots-clés du jeu
+d'entraînement, et adopter un découpage train/val « froid » (par cluster structural)
+avec déduplication des quasi-doublons. Re-run sur le jeu complet exigé avant toute
+conclusion biologique.
+
+\subsection{Objectif refondu (trois composants)}
+\begin{itemize}[leftmargin=1.4em,itemsep=3pt]
+  \item \textbf{Positifs par sous-structures} (Hermosilla \& Ropinski) : pour chaque
+        protéine, deux sous-structures connexes \emph{distinctes} (segment contigu par
+        défaut ; boule spatiale en option). La taille est l'hyperparamètre critique
+        (« sweet spot » : ni vues identiques, ni vues ne partageant plus le fold).
+  \item \textbf{File de négatifs (MoCo)} : encodeur \emph{online} + encodeur
+        \emph{momentum} (moyenne mobile, sans gradient) + file FIFO de clés négatives,
+        ce qui découple le nombre de négatifs de la taille du batch. On \emph{retire}
+        le hard-negative mining.
+  \item \textbf{Tête de projection} : la perte opère sur la projection ; l'embedding
+        d'\emph{évaluation} est pris \emph{avant} la tête (jetée), ce qui prévient le
+        collapse dimensionnel.
+\end{itemize}
+
+\subsection{Architecture et ablations}
+Encodeur équivariant sur le complexe combinatoire. Ablations, un facteur à la fois :
+\begin{center}\small
+\begin{tabular}{@{}p{3.2cm} p{5.0cm} p{6.0cm}@{}}
+\toprule
+Axe & Conditions & Question visée \\
+\midrule
+Hiérarchie & PCC complet vs $-$rang 2 vs $-$rang 3 (plat) vs GNN plat & Q1 \\
+Géométrie & invariant scalaire vs GVP (norme) vs GCP (repères) & Q5 \\
+Objectif & avec/sans tête ; MoCo vs sans négatifs (VICReg/Barlow) & Q2, Q3 \\
+Positifs & taille de sous-structure ; contigu vs spatial & Q2 \\
+Encodage distance & sinuso\"idal vs RBF & --- \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Métriques}
+
+\begin{itemize}[leftmargin=1.4em,itemsep=2pt]
+  \item \textbf{Santé / collapse (porte bloquante)} : écart-type d'embedding, cosinus
+        moyen hors-diagonale, rang effectif, alignement \& uniformité.
+  \item \textbf{Accord structural sans clustering} : TM-recall@$k$ et corrélation
+        distance--TM contre une vérité \textbf{TM-align} (et non Foldseek).
+  \item \textbf{Clustering vs références indépendantes} : ARI, V-measure,
+        homogénéité/complétude, Fowlkes--Mallows contre \textbf{CATH} (Foldseek en
+        simple sanity check) ; indices de fragmentation/fusion.
+  \item \textbf{Spécifique hiérarchie} : récupération d'homologie \emph{partielle} là
+        où les méthodes globales échouent ; delta d'ablation des rangs.
+  \item \textbf{Cohérence fonctionnelle (externe)} : pureté des clusters vis-à-vis
+        EC/GO/Pfam.
+  \item \textbf{Découverte} : nombre d'analogues « sombres » confiants (avec contrôle
+        de FDR) ; contrôles positifs de Nomburg (RNA ligase T).
+\end{itemize}
+
+\section{Baselines et témoins}
+Plancher : embedding aléatoire, modèle non entraîné. À comparer : Foldseek (global et
+local), méthodes d'embedding (FoldExplorer, TM-Vec), GNN plat (GearNet, GVP),
+décomposition en domaines $+$ Foldseek, U-Nets géométriques. Témoins : permutation des
+clusters (null pour le supervisé), embedding mélangé.
+
+\section{Correspondance question $\to$ test $\to$ critère}
+
+\begin{center}\small
+\begin{tabular}{@{}p{1.0cm} p{7.2cm} p{6.4cm}@{}}
+\toprule
+Q & Test / dispositif & Critère de décision \\
+\midrule
+Q1 & Ablation des rangs + test d'homologie partielle vs baselines forts & Le PCC complet bat $-$rang 2 / plat / (domaines$+$Foldseek) sur l'homologie partielle, sinon la hiérarchie n'apporte rien \\
+Q2 & Positifs par sous-structures + MoCo + tête ; suivi loss/TM & Loss par batch non triviale \emph{et} TM-rho/recall montent avec l'entraînement (au lieu de dégrader) \\
+Q3 & Tête de projection + file MoCo (repli VICReg/Barlow) & Rang effectif stable, cosinus moyen bas \\
+Q4 & Évaluation vs CATH, TM-align continu, fonction (EC/GO/Pfam) & Accord avec des références \emph{indépendantes} de Foldseek, au-delà d'une distillation \\
+Q5 & Échelle invariant $<$ GVP $<$ GCP & Le gain géométrique justifie le coût \\
+Q6 & Base corrigée + re-run jeu complet & Les conclusions tiennent hors prototypage \\
+Q7 & Encoder viral $+$ non-viral, retrieval multi-échelle, FDR & Reproduit les cas Nomburg ; analogues sombres sous seuil de FDR \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Portes de décision (falsifiables)}
+\begin{enumerate}[leftmargin=1.5em,itemsep=2pt]
+  \item \textbf{Tâche non triviale} : si la perte par batch s'effondre ($\sim 10^{-5}$),
+        réduire la taille des sous-structures.
+  \item \textbf{Apprentissage réel} : si TM-rho/recall ne s'améliorent pas avec
+        l'entraînement, l'objectif est encore mal posé.
+  \item \textbf{Non-circularité} : si l'accord avec CATH/fonction n'excède pas une
+        distillation de Foldseek, pas de contribution démontrée.
+  \item \textbf{Hiérarchie} : si le PCC complet n'apporte rien sur l'homologie
+        partielle, pivoter ou publier le résultat négatif.
+\end{enumerate}
+
+\section{Risques principaux}
+Mémoire (deux encodeurs équivariants sur 16~Go) ; réglage de la taille des
+sous-structures (nouveau point de défaillance) ; couverture CATH/fonction faible pour
+le virome (d'où TM-align continu en complément) ; collapse persistant (repli sur un
+objectif sans négatifs).
+
+\end{document}

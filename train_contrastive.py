@@ -19,9 +19,11 @@ import gc
 import os
 import psutil
 
-from tcpnet_adapter import Topotein
+from topotein import Topotein
 from asymmetric_topotein import AsymmetricTopoNet
 from contrastive_engine import StructuralAugmentations, NTXentLoss
+from substructure import SubstructureViews
+from moco import MoCo
 from train import PCCDataset, custom_collate, to_device, get_cluster_aware_split, DEVICE, PROC_DIR, CHECKPOINT_DIR, CLUSTER_TSV
 
 _PROC = psutil.Process(os.getpid())
@@ -29,6 +31,11 @@ _PROC = psutil.Process(os.getpid())
 # Number of train proteins in the original downsampled run. Kept in sync with
 # extract_embeddings.py so `--downsampled` here and there select the same subset.
 DOWNSAMPLED_DATASET_SIZE = 2918
+
+# How often (in gradient steps) to write a structured per-step record to the
+# training log (loss, lr, footprint, collapse-health). Env-tunable so the
+# overnight sweep can dial granularity without code changes. 0 disables.
+STEP_LOG_EVERY = int(os.environ.get('DELTAFOLD_LOG_EVERY', '20'))
 
 
 # ── macOS phys_footprint via Mach task_info ─────────────────────────────────
@@ -449,6 +456,57 @@ def extract_batch_keys(files, cache_path=None):
     return keys
 
 
+class ResidueBudgetSampler(Sampler):
+    """Batch by a total-residue budget instead of a fixed protein count.
+
+    Without this, the default (count-based) loader puts `batch_size` proteins in
+    every batch regardless of their sizes, so a batch that happens to draw several
+    large viral proteins explodes -- on the equivariant tcpnet model that overflows
+    the ~20GB MPS allocator. Greedily packs a per-epoch shuffle of indices into
+    batches whose summed residue count stays under `max_residues` (with
+    `batch_size` as a hard count cap), keeping per-step memory/compute bounded and
+    roughly uniform. Exposes `max_residues` + `set_epoch` for the MemoryGovernor.
+    """
+    def __init__(self, lengths, batch_size, seed=42, max_residues=2000):
+        self.lengths = [int(x) for x in lengths]
+        self.n = len(self.lengths)
+        self.batch_size = max(2, batch_size)
+        self.seed = seed
+        self.max_residues = max_residues
+        self.epoch = 0
+
+    def set_epoch(self, epoch):
+        self.epoch = epoch
+
+    def __len__(self):
+        total = sum(self.lengths)
+        return max(1, total // max(1, self.max_residues), self.n // self.batch_size)
+
+    def __iter__(self):
+        rng = np.random.default_rng(self.seed + self.epoch)
+        batches, cur, cur_res = [], [], 0
+        for idx in rng.permutation(self.n):
+            idx = int(idx)
+            r = self.lengths[idx]
+            # Close on the count cap, or on the residue budget but ONLY once the
+            # batch already holds >=2 proteins. That way a lone large protein
+            # isn't dropped -- it just gets one partner and mildly overflows the
+            # budget (still well under the OOM cap), and InfoNCE keeps >=2 anchors.
+            if cur and (len(cur) >= self.batch_size or
+                        (len(cur) >= 2 and cur_res + r > self.max_residues)):
+                batches.append(cur)
+                cur, cur_res = [], 0
+            cur.append(idx)
+            cur_res += r
+        if len(cur) >= 2:
+            batches.append(cur)
+        elif cur and batches:
+            batches[-1].extend(cur)  # fold a trailing singleton into the last batch
+        rng.shuffle(batches)
+        for b in batches:
+            yield b
+
+
 class HardNegativeBatchSampler(Sampler):
     """Hard-negative mining via batch construction (report 7, "the single most
     important intervention"). Groups dataset indices into length bins, and within
@@ -696,6 +754,21 @@ def contrastive_collate(batch):
     
     return custom_collate(views_1 + views_2), paths
 
+def moco_collate(batch):
+    """MoCo collate: keep the two views SEPARATE (view1 -> f_q, view2 -> f_k).
+    Returns (feats_v1, feats_v2, paths) — each feats_* is an independently
+    collated PCC batch of the same B proteins in the same order."""
+    valid = [b for b in batch if b[0] is not None and b[0][0] is not None
+             and b[0][1] is not None
+             and b[0][0]['rank1']['source'].shape[1] == 16
+             and b[0][1]['rank1']['source'].shape[1] == 16]
+    if not valid:
+        return None
+    v1 = [b[0][0] for b in valid]
+    v2 = [b[0][1] for b in valid]
+    paths = [b[1] for b in valid]
+    return custom_collate(v1), custom_collate(v2), paths
+
 def worker_init_fn(worker_id):
     import torch
     torch.set_num_threads(1)
@@ -759,10 +832,32 @@ def train_contrastive(model_type='topotein', epochs=30, batch_size=16, lr=1e-4, 
                       hard_neg_mining=False, cleanup_every=50, max_residues=4000, pad_buckets=True,
                       tm_cache_path=None, soft_supcon=False, use_crop=False, jitter_sigma=0.3,
                       edge_attn_softmax=True, dist_bias_gamma=0.1, detach_h3=True,
+                      dist_encoding='sinusoidal', rbf_dim=16,
                       mem_soft_gb=11.0, mem_hard_gb=14.0, min_residues=2000,
-                      no_budget_adapt=False, downsampled=False):
+                      no_budget_adapt=False, downsampled=False,
+                      num_layers=None, emb_dim=None, knn=None,
+                      num_message_layers=None, num_feedforward_layers=None,
+                      temperature=0.1,
+                      objective='infonce', moco_k=8192, moco_m=0.99,
+                      sub_f_lo=0.5, sub_f_hi=0.8, sub_mode='contiguous',
+                      scalarize='frame', vector_dim=16,
+                      tensor_diagram='default', readout='node',
+                      num_workers=None,
+                      disable_typecheck=False):
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
     tlog = TrainingLog(os.path.join(CHECKPOINT_DIR, 'training_log.jsonl.gz'))
+
+    # Residue-budget defaults are model-aware. The equivariant tcpnet/topotein
+    # model (per-edge + per-SSE attention, vector channels, 6 layers) costs far
+    # more memory per residue on MPS than the asymmetric model, so it needs a much
+    # smaller per-batch residue budget to stay under the ~20GB MPS allocator cap.
+    # train.py passes None when the user didn't override; resolve it here.
+    is_tcpnet_model = (model_type != 'asymmetric')
+    if max_residues is None:
+        max_residues = 1800 if is_tcpnet_model else 3500
+    if min_residues is None:
+        min_residues = 1200 if is_tcpnet_model else 3500
+    print(f"Residue budget: max={max_residues} min={min_residues} (model={model_type})")
 
     from train import get_split
     train_files, val_files = get_split(PROC_DIR, CLUSTER_TSV, split_ratio=0.8, seed=42, split=split)
@@ -798,11 +893,20 @@ def train_contrastive(model_type='topotein', epochs=30, batch_size=16, lr=1e-4, 
                 if len(parts) >= 2:
                     acc_to_cluster[extract_accession(parts[1])] = extract_accession(parts[0])
 
-    # §5.5: jitter-only augmentation by default (use_crop=False, sigma=0.3A). SSE
-    # cropping is TM-score-destructive; it teaches invariance to domain-level
-    # structural differences that TM-score is meant to measure.
-    aug = StructuralAugmentations(jitter_sigma=jitter_sigma, drop_ratio_range=(0.1, 0.2),
-                                  mask_ratio=0.15, use_crop=use_crop)
+    is_moco = (objective == 'moco')
+    if is_moco:
+        # plan_implementation_3: positives = two distinct connected substructures
+        # (non-trivial task), replacing the trivial jitter/crop/mask views.
+        aug = SubstructureViews(f_range=(sub_f_lo, sub_f_hi), mode=sub_mode)
+        hard_neg_mining = False                     # MoCo queue replaces hard-neg
+        print(f"Objective: MoCo (substructure {sub_mode} f∈[{sub_f_lo},{sub_f_hi}], "
+              f"K={moco_k}, m={moco_m}, tau={temperature})")
+    else:
+        # §5.5: jitter-only augmentation by default (use_crop=False, sigma=0.3A). SSE
+        # cropping is TM-score-destructive; it teaches invariance to domain-level
+        # structural differences that TM-score is meant to measure.
+        aug = StructuralAugmentations(jitter_sigma=jitter_sigma, drop_ratio_range=(0.1, 0.2),
+                                      mask_ratio=0.15, use_crop=use_crop)
 
     # §5.1/5.2/5.6: load the pre-computed pairwise TM-score cache once, if provided
     # and actually needed (soft InfoNCE or the TM-aux regression).
@@ -829,11 +933,15 @@ def train_contrastive(model_type='topotein', epochs=30, batch_size=16, lr=1e-4, 
     # Val always uses num_workers=0 and no batch_sampler: parallel workers + a
     # separate sampler on MPS unified memory caused unbounded accumulation and
     # crashes at ~200-300 steps. num_workers=0 is safe; train parallelism is enough.
-    num_workers = max(1, (os.cpu_count() or 4) // 2)
+    # `num_workers` overridable (the --deltafold CUDA preset sets 16 for the 96-thread
+    # box); default is cpu_count//2 (the old behaviour).
+    if num_workers is None:
+        num_workers = max(1, (os.cpu_count() or 4) // 2)
+    print(f"DataLoader: {num_workers} train workers, pin_memory={DEVICE.type == 'cuda'}")
 
     def _make_loader(dataset, *, batch_sampler=None, workers=num_workers, shuffle=False):
         shared_kwargs = dict(
-            collate_fn=contrastive_collate,
+            collate_fn=moco_collate if is_moco else contrastive_collate,
             pin_memory=DEVICE.type == 'cuda',
             worker_init_fn=worker_init_fn if workers > 0 else None,
         )
@@ -858,8 +966,16 @@ def train_contrastive(model_type='topotein', epochs=30, batch_size=16, lr=1e-4, 
         def make_train_loader():
             return _make_loader(train_dataset, batch_sampler=train_sampler)
     else:
+        # Even without hard-negative mining, batch by residue budget (not protein
+        # count) so a few large proteins can't overflow MPS memory. Lengths come
+        # from the same cached metadata the hard-neg sampler uses.
+        cache_path = os.path.join(CHECKPOINT_DIR, 'batch_keys_cache.pt')
+        lengths = [k[0] for k in extract_batch_keys(train_files, cache_path)]
+        train_sampler = ResidueBudgetSampler(lengths, batch_size, seed=42, max_residues=max_residues)
+        print(f"Residue-budget batching: budget {max_residues} (orig; ~{int(max_residues*1.75)} in-forward "
+              f"after 2 views), count cap {batch_size}, ~{len(train_sampler)} batches/epoch")
         def make_train_loader():
-            return _make_loader(train_dataset, shuffle=True)
+            return _make_loader(train_dataset, batch_sampler=train_sampler)
     train_loader = make_train_loader()  # one instance for len()/scheduler bookkeeping
     val_loader = _make_loader(val_dataset, workers=0)
 
@@ -887,9 +1003,47 @@ def train_contrastive(model_type='topotein', epochs=30, batch_size=16, lr=1e-4, 
             'edge_attn_softmax': edge_attn_softmax,
             'dist_bias_gamma': dist_bias_gamma,
             'detach_h3': detach_h3,
+            # Distance encoding (§1, Mod 1). Persisted so extract_embeddings.py
+            # rebuilds the identical rank1_emb (input dim depends on it).
+            'dist_encoding': dist_encoding,
+            'rbf_dim': rbf_dim,
         })
         model = AsymmetricTopoNet(scalar_dim=128, **model_config).to(DEVICE)
+    elif model_type == 'equivariant':
+        # SE(3)/O(3) geometric model (plan_experimentation_v2 §F). Consumes the same
+        # rank-dict as `asymmetric` (drop-in in the loop; not path-based like tcpnet).
+        # rbf_dim>0 selects RBF distance encoding (0 = sinusoidal). Persisted so
+        # extract_embeddings rebuilds the identical architecture.
+        from equivariant_topotein import EquivariantTopoNet
+        model_config.update({
+            'edge_attn_softmax': edge_attn_softmax,
+            'dist_bias_gamma': dist_bias_gamma,
+            'scalarize': scalarize,          # 'frame' (SE(3)+chiral) or 'norm' (O(3))
+            'vector_dim': vector_dim,
+            'rbf_dim': (rbf_dim if dist_encoding == 'rbf' else 0),
+        })
+        if num_layers is not None:
+            model_config['num_layers'] = num_layers
+        model = EquivariantTopoNet(scalar_dim=128, **model_config).to(DEVICE)
     else:
+        # Full Topotein / TCPNet on the PCC (topotein.py), the faithful
+        # implementation of the protocol's §Architecture. Consumes the same
+        # rank-dict as `asymmetric` / `equivariant` (dict path in the loop; it
+        # sets no `is_tcpnet` flag, so it is NOT the old PDB-re-lifting adapter).
+        # Every shape-determining knob goes in model_config so the checkpoint
+        # records it and extract_embeddings.py rebuilds the identical model.
+        model_config.update({
+            'scalarize': scalarize,               # 'frame' (edge-centric SE(3)+chiral) | 'norm' (O(3))
+            'vector_dim': vector_dim,             # protocol d_v
+            'tensor_diagram': tensor_diagram,     # message-passing order / channels (--tensor-diagram)
+            'readout': readout,                   # 'node' pooling (default) | 'protein' cell
+            'edge_attn_softmax': edge_attn_softmax,
+            'rbf_dim': (rbf_dim if dist_encoding == 'rbf' else 0),
+        })
+        if num_layers is not None:
+            model_config['num_layers'] = num_layers
+        # scalar_dim is fixed at the protocol's d_s=128; the legacy --emb-dim knob
+        # (old adapter width) does not apply to the new encoder.
         model = Topotein(scalar_dim=128, **model_config).to(DEVICE)
 
     print(f"Mitigations: PE={use_positional_encoding} residue={use_residue_features} "
@@ -898,19 +1052,38 @@ def train_contrastive(model_type='topotein', epochs=30, batch_size=16, lr=1e-4, 
     if model_type == 'asymmetric':
         print(f"Arch fixes (§5.3/5.4/5.7): edge_attn_softmax={edge_attn_softmax} "
               f"dist_bias_gamma={dist_bias_gamma} detach_h3={detach_h3}")
+        print(f"Distance encoding (§1): {dist_encoding}"
+              + (f" (K={rbf_dim})" if dist_encoding == 'rbf' else ""))
+    if model_type == 'equivariant':
+        print(f"Equivariant (§F): scalarize={scalarize} vector_dim={vector_dim} "
+              f"rbf_dim={rbf_dim if dist_encoding=='rbf' else 0}")
+    if model_type == 'topotein':
+        print(f"Topotein/TCPNet: scalarize={scalarize} vector_dim={vector_dim} "
+              f"tensor_diagram={tensor_diagram} readout={readout} "
+              f"num_layers={num_layers or 4} rbf_dim={rbf_dim if dist_encoding=='rbf' else 0}")
     print(f"Aug (§5.5): use_crop={use_crop} jitter_sigma={jitter_sigma} | "
           f"soft_supcon (§5.6)={soft_supcon} | tm_cache={'yes' if tm_cache else 'no'}")
+
+    # plan_implementation_3 §2/§3: wrap the encoder in MoCo (momentum key encoder +
+    # negative queue + projection head). `model` stays == moco.encoder_q, so the
+    # checkpoint / extract_embeddings path (which builds the bare encoder and loads
+    # model_state_dict) is unchanged; the optimizer trains encoder_q + proj_q.
+    moco = None
+    opt_params = list(model.parameters())
+    if is_moco:
+        moco = MoCo(model, dim=128, K=moco_k, m=moco_m, tau=temperature).to(DEVICE)
+        opt_params = [p for p in moco.parameters() if p.requires_grad]
 
     # Fused AdamW runs all parameter updates in a single kernel dispatch instead of
     # one-per-param, saving ~10ms/step on MPS. Falls back silently if unavailable.
     try:
-        optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5, fused=True)
+        optimizer = optim.AdamW(opt_params, lr=lr, weight_decay=1e-5, fused=True)
         print("Optimizer: AdamW (fused)")
     except (TypeError, RuntimeError):
-        optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
+        optimizer = optim.AdamW(opt_params, lr=lr, weight_decay=1e-5)
         print("Optimizer: AdamW (eager)")
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2)
-    criterion = NTXentLoss(temperature=0.1, hard_neg_beta=hard_neg_beta).to(DEVICE)
+    criterion = NTXentLoss(temperature=temperature, hard_neg_beta=hard_neg_beta).to(DEVICE)
     
     start_epoch = 0
     best_loss = float('inf')
@@ -920,11 +1093,20 @@ def train_contrastive(model_type='topotein', epochs=30, batch_size=16, lr=1e-4, 
     if os.path.exists(last_ckpt_path):
         print(f"Loading checkpoint {last_ckpt_path}...")
         checkpoint = torch.load(last_ckpt_path, map_location=DEVICE)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        start_epoch = checkpoint['epoch']
-        best_loss = checkpoint.get('best_loss', float('inf'))
-        best_ari = checkpoint.get('best_ari', float('-inf'))
+        try:
+            model.load_state_dict(checkpoint['model_state_dict'])
+        except Exception as e:
+            print(f"[!] model weights not loaded from checkpoint ({e}); starting from init.")
+        # The optimizer param-groups change when the objective changes (e.g. infonce
+        # -> moco adds projection-head params), so a mismatch must NOT crash — just
+        # start the optimizer fresh. Same for resuming a run with a different setup.
+        try:
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            start_epoch = checkpoint['epoch']
+            best_loss = checkpoint.get('best_loss', float('inf'))
+            best_ari = checkpoint.get('best_ari', float('-inf'))
+        except (ValueError, KeyError) as e:
+            print(f"[!] optimizer state not restored ({e}); fresh optimizer, epoch 0.")
     
     print(f"Starting Contrastive Training ({model_type}): {len(train_files)} train, {len(val_files)} val samples.")
     print(f"Logging to {tlog.path}")
@@ -940,12 +1122,12 @@ def train_contrastive(model_type='topotein', epochs=30, batch_size=16, lr=1e-4, 
                 with_stack=True,
                 profile_memory=True
             ) as prof:
-                best_loss, best_ari = _run_training_epoch(model, None, train_loader, val_loader, optimizer, scheduler, criterion, epoch, epochs, 0.0, accum_steps, tlog, True, best_loss, model_type, acc_to_cluster, profiler=prof, tm_aux_weight=tm_aux_weight, supervised=supervised, model_config=model_config, cleanup_every=cleanup_every, pad_buckets=pad_buckets, best_ari=best_ari, tm_cache=tm_cache, soft_supcon=soft_supcon, make_train_loader=make_train_loader, train_sampler=train_sampler, governor=governor)
+                best_loss, best_ari = _run_training_epoch(model, None, train_loader, val_loader, optimizer, scheduler, criterion, epoch, epochs, 0.0, accum_steps, tlog, True, best_loss, model_type, acc_to_cluster, profiler=prof, tm_aux_weight=tm_aux_weight, supervised=supervised, model_config=model_config, cleanup_every=cleanup_every, pad_buckets=pad_buckets, best_ari=best_ari, tm_cache=tm_cache, soft_supcon=soft_supcon, make_train_loader=make_train_loader, train_sampler=train_sampler, governor=governor, moco=moco)
 
             print("\n" + "="*30 + " PROFILER RESULTS " + "="*30)
             print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=20))
         else:
-            best_loss, best_ari = _run_training_epoch(model, None, train_loader, val_loader, optimizer, scheduler, criterion, epoch, epochs, 0.0, accum_steps, tlog, True, best_loss, model_type, acc_to_cluster, tm_aux_weight=tm_aux_weight, supervised=supervised, model_config=model_config, cleanup_every=cleanup_every, pad_buckets=pad_buckets, best_ari=best_ari, tm_cache=tm_cache, soft_supcon=soft_supcon, make_train_loader=make_train_loader, train_sampler=train_sampler, governor=governor)
+            best_loss, best_ari = _run_training_epoch(model, None, train_loader, val_loader, optimizer, scheduler, criterion, epoch, epochs, 0.0, accum_steps, tlog, True, best_loss, model_type, acc_to_cluster, tm_aux_weight=tm_aux_weight, supervised=supervised, model_config=model_config, cleanup_every=cleanup_every, pad_buckets=pad_buckets, best_ari=best_ari, tm_cache=tm_cache, soft_supcon=soft_supcon, make_train_loader=make_train_loader, train_sampler=train_sampler, governor=governor, moco=moco)
 
         # Between-epoch cleanup: the just-finished DataLoader iterator (and its
         # worker/prefetch buffers) is now out of scope here, so collecting it now
@@ -959,8 +1141,9 @@ def train_contrastive(model_type='topotein', epochs=30, batch_size=16, lr=1e-4, 
     print("Training finished.")
 
 # Refactored common epoch logic into a helper function
-def _run_training_epoch(model, head, train_loader, val_loader, optimizer, scheduler, criterion, epoch, epochs, mask_ratio, accum_steps, tlog, is_contrastive, best_loss, model_type, acc_to_cluster=None, profiler=None, tm_aux_weight=0.0, supervised=True, model_config=None, cleanup_every=50, pad_buckets=True, best_ari=float('-inf'), tm_cache=None, soft_supcon=False, make_train_loader=None, train_sampler=None, governor=None):
+def _run_training_epoch(model, head, train_loader, val_loader, optimizer, scheduler, criterion, epoch, epochs, mask_ratio, accum_steps, tlog, is_contrastive, best_loss, model_type, acc_to_cluster=None, profiler=None, tm_aux_weight=0.0, supervised=True, model_config=None, cleanup_every=50, pad_buckets=True, best_ari=float('-inf'), tm_cache=None, soft_supcon=False, make_train_loader=None, train_sampler=None, governor=None, moco=None):
     model.train()
+    if moco is not None: moco.train()
     if head: head.train()
     epoch_loss = 0.0
     step_losses = []
@@ -1007,16 +1190,42 @@ def _run_training_epoch(model, head, train_loader, val_loader, optimizer, schedu
 
     pbar = tqdm(total=total_steps, desc=f"Epoch {epoch+1}/{epochs}")
     done = 0          # gradient steps actually completed this epoch
+    last_std = last_cos = float('nan')   # most recent collapse-health probe
     for batch in _restartable_batches():
         if batch is None:
             if profiler: profiler.step()
             continue
         done += 1
 
-        if is_contrastive:
+        if moco is not None:
+            # MoCo path (plan_impl_3): batch = (feats_v1, feats_v2, paths); run
+            # view1 -> f_q, view2 -> f_k + negative queue. No feature jitter/dropout
+            # (the substructure views ARE the augmentation).
+            feats_q_raw, feats_k_raw, paths = batch
+            fq = to_device(feats_q_raw, DEVICE)
+            fk = to_device(feats_k_raw, DEVICE)
+            if pad_buckets:
+                fq, real_B = pad_to_buckets(fq)
+                fk, _ = pad_to_buckets(fk)
+            else:
+                real_B = fq['rank3']['protein_size'].shape[0]
+            loss = moco(fq, fk, real_B=real_B)
+            if done % 10 == 0:
+                with torch.no_grad():
+                    zc = moco.embed(fq, real_B=real_B)
+                emb_std, mean_cos = collapse_metrics(zc)
+                last_std, last_cos = emb_std, mean_cos
+                if mean_cos > 0.9 or emb_std < 0.02:
+                    print(f"\n[!] Possible collapse at epoch {epoch+1} step {done}: "
+                          f"emb_std={emb_std:.4f} mean_cos={mean_cos:.4f}")
+                    tlog.event({'t': 'collapse', 'ep': epoch+1, 's': done,
+                                'std': round(emb_std, 5), 'cos': round(mean_cos, 5)})
+                del zc
+            features, model_in, z = fq, fk, None   # placeholders for the end-of-step del
+        elif is_contrastive:
             batch_data, paths = batch
             features = to_device(batch_data, DEVICE)
-            
+
             # Stronger jitter and Feature Dropout to prevent shortcut learning
             if model.training:
                 r3 = features['rank3']
@@ -1078,9 +1287,11 @@ def _run_training_epoch(model, head, train_loader, val_loader, optimizer, schedu
                 if tm_loss is not None:
                     loss = loss + tm_aux_weight * tm_loss
 
-            # Collapse detection: check every 10 steps; only log to tlog on threshold breach.
+            # Collapse detection: check every 10 steps; only log a 'collapse' event
+            # on threshold breach, but keep the latest probe for the per-step record.
             if done % 10 == 0:
                 emb_std, mean_cos = collapse_metrics(z)
+                last_std, last_cos = emb_std, mean_cos
                 if mean_cos > 0.9 or emb_std < 0.02:
                     msg = f"emb_std={emb_std:.4f} mean_cos={mean_cos:.4f}"
                     print(f"\n[!] Possible collapse at epoch {epoch+1} step {done}: {msg}")
@@ -1115,7 +1326,10 @@ def _run_training_epoch(model, head, train_loader, val_loader, optimizer, schedu
         if lv > step_loss_max: step_loss_max = lv
 
         if done % accum_steps == 0 or done == total_steps:
-            params_to_clip = [p for p in model.parameters() if p.grad is not None]
+            if moco is not None:
+                params_to_clip = [p for p in moco.parameters() if p.requires_grad and p.grad is not None]
+            else:
+                params_to_clip = [p for p in model.parameters() if p.grad is not None]
             if head: params_to_clip.extend([p for p in head.parameters() if p.grad is not None])
             
             if params_to_clip:
@@ -1134,6 +1348,16 @@ def _run_training_epoch(model, head, train_loader, val_loader, optimizer, schedu
             mem_gb = governor.last_fp or _report_memory(done, epoch + 1)
             pbar.set_postfix({'loss': f"{current_loss:.4f}", 'fp': f"{mem_gb:.1f}GB"})
             step_losses.clear()
+
+        # Structured per-batch record (loss / lr / footprint / collapse-health) for
+        # offline analysis. Buffered in the TrainingLog, flushed with the epoch.
+        if STEP_LOG_EVERY and (done % STEP_LOG_EVERY == 0 or done == total_steps):
+            tlog.event({'t': 'step', 'ep': epoch + 1, 's': done,
+                        'loss': round(lv, 5),
+                        'lr': round(optimizer.param_groups[0]['lr'], 8),
+                        'fp': round(governor.last_fp or 0.0, 2),
+                        'std': round(last_std, 5) if last_std == last_std else None,
+                        'cos': round(last_cos, 5) if last_cos == last_cos else None})
 
         if profiler: profiler.step()
 
@@ -1177,7 +1401,22 @@ def _run_training_epoch(model, head, train_loader, val_loader, optimizer, schedu
     with torch.no_grad():
         for v_step, v_batch in enumerate(tqdm(val_loader, desc="Validation", leave=False)):
             if v_batch is None: continue
-            if is_contrastive:
+            if moco is not None:
+                # update=False: validation must NOT mutate the key encoder or the
+                # negative queue. ARI/TM embedding = normalize(h) from f_q (view1).
+                vq = to_device(v_batch[0], DEVICE)
+                vk = to_device(v_batch[1], DEVICE)
+                if pad_buckets:
+                    vq, v_realB = pad_to_buckets(vq)
+                    vk, _ = pad_to_buckets(vk)
+                else:
+                    v_realB = vq['rank3']['protein_size'].shape[0]
+                val_loss_epoch += moco(vq, vk, real_B=v_realB, update=False).item()
+                if acc_to_cluster and v_realB > 0:
+                    ari_embs.append(moco.embed(vq, real_B=v_realB).detach().cpu().numpy())
+                    ari_paths.extend(v_batch[2][:v_realB])
+                del vq, vk, v_batch
+            elif is_contrastive:
                 v_feat = to_device(v_batch[0], DEVICE)
                 if getattr(model, 'is_tcpnet', False):
                     v_in = None  # bound so the end-of-step `del` works on this path
@@ -1285,10 +1524,18 @@ def _run_training_epoch(model, head, train_loader, val_loader, optimizer, schedu
         'model_config': model_config or {},
     }
 
-    # Save last checkpoint
+    # Save last checkpoint (rolling pointer to the most recent epoch).
     last_path = os.path.join(CHECKPOINT_DIR, f'checkpoint_contrastive_{model_type}_last.pth')
     torch.save(checkpoint_data, last_path)
-    
+
+    # Save a per-epoch checkpoint that is never overwritten, so every epoch's
+    # weights stay available (e.g. for the §3 epoch-wise evaluation / picking a
+    # checkpoint after the fact rather than trusting only best-loss/ARI).
+    epoch_path = os.path.join(
+        CHECKPOINT_DIR, f'checkpoint_contrastive_{model_type}_epoch{epoch + 1:03d}.pth')
+    torch.save(checkpoint_data, epoch_path)
+    print(f"Saved epoch checkpoint -> {os.path.basename(epoch_path)}")
+
     # Save best checkpoint separately (triggers on best val loss OR best ARI)
     if is_best:
         best_path = os.path.join(CHECKPOINT_DIR, f'checkpoint_contrastive_{model_type}_best.pth')
@@ -1307,7 +1554,11 @@ def _run_training_epoch(model, head, train_loader, val_loader, optimizer, schedu
         ev_compact = {k: _safe(eval_metrics[k]) if isinstance(eval_metrics[k], float)
                       else eval_metrics[k]
                       for k in ('hdbscan_ari','hdbscan_nmi','tm_rho','tm_recall',
-                                'n_clusters','singleton_frac') if k in eval_metrics}
+                                'n_clusters','singleton_frac',
+                                # §6.1 health gate + Mod 3/4 (plan metrics)
+                                'tm_alignment','effective_rank','emb_std','mean_cos','uniformity',
+                                'homogeneity','completeness','v_measure','fowlkes_mallows',
+                                'fragmentation','fusion','perm_ari') if k in eval_metrics}
     epoch_rec = {
         't': 'epoch', 'ep': epoch + 1,
         'steps': train_steps_done,

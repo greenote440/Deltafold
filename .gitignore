@@ -20,6 +20,7 @@ __pycache__/
 .idea/
 
 # Data and Models
+code_and_intermediate_data/
 checkpoints/
 clusters/
 data/

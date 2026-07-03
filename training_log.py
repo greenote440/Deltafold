@@ -10,6 +10,10 @@ Each record is one JSON line — trivial to read, token-efficient to benchmark.
     restarts, budget, eval {ari, nmi, tm_rho, recall, k_clusters, singletons}
     + optional loss_range [min,max] for a quick sanity check
 
+  Per-step record ("step", every DELTAFOLD_LOG_EVERY grad steps):
+    ep, s (step), loss, lr, fp (footprint GB), std/cos (collapse-health probe).
+    Buffered during the epoch and flushed with the epoch record.
+
   Sparse event records ("restart", "collapse"):
     only written when something notable happens — keeps the file short.
 

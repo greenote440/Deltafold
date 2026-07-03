@@ -195,8 +195,26 @@ class AsymmetricTopoNet(nn.Module):
     def __init__(self, scalar_dim=128, num_layers=4, dropout=0.1,
                  use_positional_encoding=True, use_residue_features=True,
                  use_3di_features=True, edge_attn_softmax=False,
-                 dist_bias_gamma=0.0, detach_h3=False):
+                 dist_bias_gamma=0.0, detach_h3=False,
+                 dist_encoding='sinusoidal', rbf_dim=16,
+                 rbf_dmin=3.5, rbf_dmax=20.0):
         super().__init__()
+
+        # Distance-encoding choice (plan_implementation §1, Modification 1). The
+        # rank-1 edge scalar is the raw Cα–Cα distance plus an expansion of it:
+        #   'sinusoidal' -> the stored 16-d Transformer encoding (original; ~half
+        #                   its bands are dead over the 0–20 Å contact range).
+        #   'rbf'        -> K Gaussian radial bases computed in-forward from the
+        #                   raw distance (calibrated to the contact scale). No
+        #                   re-lifting needed; the raw distance is already stored.
+        # Default 'sinusoidal' preserves the original forward pass (and keeps old
+        # checkpoints loadable); the training entrypoint opts into 'rbf'.
+        assert dist_encoding in ('sinusoidal', 'rbf')
+        self.dist_encoding = dist_encoding
+        if dist_encoding == 'rbf':
+            from rbf import GaussianRBF
+            self.rbf = GaussianRBF(num_rbf=rbf_dim, d_min=rbf_dmin, d_max=rbf_dmax)
+        edge_in = 1 + (rbf_dim if dist_encoding == 'rbf' else 16)
 
         # Shortcut mitigations (report 7). Each flag, when False, zeros the
         # corresponding Rank-0 input channel WITHOUT changing tensor dims, so
@@ -219,7 +237,7 @@ class AsymmetricTopoNet(nn.Module):
         )
         
         self.rank1_emb = nn.Sequential(
-            nn.Linear(17, scalar_dim),
+            nn.Linear(edge_in, scalar_dim),
             nn.LayerNorm(scalar_dim),
             nn.SiLU(),
             nn.Linear(scalar_dim, scalar_dim)
@@ -259,7 +277,7 @@ class AsymmetricTopoNet(nn.Module):
             nn.LayerNorm(scalar_dim)
         )
 
-    def forward(self, features, return_nodes=False):
+    def forward(self, features, return_nodes=False, return_repr=False):
         r0, r1, r2_feat, r3 = features['rank0'], features['rank1'], features['rank2_features'], features['rank3']
         device = r0['aa'].device
         
@@ -271,8 +289,14 @@ class AsymmetricTopoNet(nn.Module):
         di = r0['3di'] if self.use_3di_features else torch.zeros_like(r0['3di'])
         pe = r0['positional_encoding'] if self.use_positional_encoding else torch.zeros_like(r0['positional_encoding'])
         h0 = self.rank0_emb(torch.cat([aa, di, r0['phi_psi'], pe], dim=-1))
-        # Optimization: Flatten h1 to 2D (E, dim) immediately
-        h1_raw = torch.cat([r1['distance'].unsqueeze(-1), r1['distance_encoding']], dim=-1).flatten(0, 1)
+        # Rank-1 edge scalars: raw distance + its expansion (RBF or sinusoidal,
+        # §1). RBF is computed in-forward from the stored raw distance; the
+        # sinusoidal path reuses the stored distance_encoding. Flatten to (E, ·).
+        if self.dist_encoding == 'rbf':
+            dist_exp = self.rbf(r1['distance'])               # (N, K_edges, rbf_dim)
+        else:
+            dist_exp = r1['distance_encoding']                # (N, K_edges, 16)
+        h1_raw = torch.cat([r1['distance'].unsqueeze(-1), dist_exp], dim=-1).flatten(0, 1)
         h1 = self.rank1_emb(h1_raw)
         h2 = self.rank2_emb(self.rank2_input_norm(r2_feat)) if r2_feat.numel() > 0 else torch.empty((0, 128), device=device)
         
@@ -295,11 +319,15 @@ class AsymmetricTopoNet(nn.Module):
         h0_count = torch.zeros(B, 1, device=device).index_add_(0, batch_idx_0, torch.ones_like(h0[:, :1]))
         h0_pool = h0_sum / h0_count.clamp(min=1)
         
-        out = self.output_head(torch.cat([h0_pool, h3], dim=-1))
-        out = F.normalize(out, p=2, dim=-1)
+        # `repr` is the readout representation h (pre-L2-normalization). Eval uses
+        # normalize(h); the contrastive projection head (plan_impl_3 §3) consumes h.
+        repr_ = self.output_head(torch.cat([h0_pool, h3], dim=-1))
+        out = F.normalize(repr_, p=2, dim=-1)
         out_formatted = out if B > 1 else out.squeeze(0)
-        
+
+        if return_repr:
+            return repr_ if B > 1 else repr_.squeeze(0)
         if return_nodes:
             return out_formatted, h0
-            
+
         return out_formatted

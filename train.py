@@ -3,6 +3,7 @@ Deltafold Training Entry Point
 Modular training script supporting Topotein/Asymmetric models and MTM/Contrastive tasks.
 """
 import os
+import sys
 import glob
 import re
 import random
@@ -15,9 +16,34 @@ import torch.profiler
 from torch.utils.data import Dataset, DataLoader
 from contrastive_engine import StructuralAugmentations
 
-DEVICE = torch.device('mps' if torch.backends.mps.is_available() else ('cuda' if torch.cuda.is_available() else 'cpu'))
+
+def _deltafold_requested():
+    """True when this run targets the CUDA `deltafold` box (1x L40S, Xeon, 1TB RAM).
+    Detected from argv/env at import time so DEVICE is resolved to CUDA *before*
+    anything binds it — the `--deltafold` flag itself is parsed later in main()."""
+    return ('--deltafold' in sys.argv) or (os.environ.get('DELTAFOLD_DEVICE') == 'cuda')
+
+
+def _resolve_device():
+    """Pick the compute device. `--deltafold` (or DELTAFOLD_DEVICE=cuda) forces the
+    CUDA path instead of the mps/cpu autodetect and pins a *single* GPU (the box has
+    two L40S but only one is usable), honouring a pre-set CUDA_VISIBLE_DEVICES."""
+    if _deltafold_requested():
+        os.environ.setdefault('CUDA_VISIBLE_DEVICES', '0')   # one GPU only
+        if not torch.cuda.is_available():
+            raise SystemExit("[--deltafold] no CUDA GPU visible to torch "
+                             "(run this on the deltafold box, not macOS/MPS).")
+        return torch.device('cuda')
+    return torch.device('mps' if torch.backends.mps.is_available()
+                        else ('cuda' if torch.cuda.is_available() else 'cpu'))
+
+
+DEVICE = _resolve_device()
 PROC_DIR = './data/hoan_processed'
-CHECKPOINT_DIR = './checkpoints'
+# Overridable per-run (e.g. by the overnight ablation sweep) so each config's
+# checkpoints / training_log / epoch_eval land in their own directory and don't
+# collide. Resolved at import time from the env, before train_contrastive binds it.
+CHECKPOINT_DIR = os.environ.get('DELTAFOLD_CKPT_DIR', './checkpoints')
 CLUSTER_TSV = './data/cluster.tsv'
 
 class PCCDataset(Dataset):
@@ -224,10 +250,38 @@ def get_phylogenetic_split(data_dir, split_ratio=0.8, seed=42, level='taxid'):
     return train_files, val_files
 
 
+def get_corrected_split(prefix='./data/subbase_corrected'):
+    """Loads the corrected prototyping sub-base (plan_experimentation_v2 §4) from
+    the manifests written by ``scripts/utilities/build_corrected_subbase.py``.
+
+    This is the bias-corrected replacement for the old downsampler
+    (``subdataset_files_refined.txt``): the manifests already encode a
+    representative size distribution (singletons kept), a cold cluster-aware
+    train/val split, and exact-sequence dedup, so no further sampling happens
+    here. Keyword positive-controls live in ``<prefix>_controls.txt`` and are
+    deliberately NOT loaded into train/val."""
+    train_path, val_path = f"{prefix}_train.txt", f"{prefix}_val.txt"
+    if not (os.path.exists(train_path) and os.path.exists(val_path)):
+        raise FileNotFoundError(
+            f"Corrected sub-base manifests not found ({train_path} / {val_path}). "
+            f"Run: python scripts/utilities/build_corrected_subbase.py")
+
+    def _read(p):
+        with open(p) as f:
+            return [ln.strip() for ln in f if ln.strip()]
+
+    train_files, val_files = _read(train_path), _read(val_path)
+    print(f"Corrected sub-base (§4): {len(train_files)} train / {len(val_files)} val "
+          f"proteins (cold cluster split, deduped, size-distribution preserved).")
+    return train_files, val_files
+
+
 def get_split(data_dir, cluster_tsv_path, split_ratio=0.8, seed=42, split='cluster'):
     """Dispatches to the requested split strategy."""
     if split == 'phylo':
         return get_phylogenetic_split(data_dir, split_ratio=split_ratio, seed=seed, level='taxid')
+    if split == 'corrected':
+        return get_corrected_split()
     return get_cluster_aware_split(data_dir, cluster_tsv_path, split_ratio=split_ratio, seed=seed)
 
 
@@ -239,7 +293,7 @@ def run_profiler(model_type, task, batch_size, dataset_size=None):
         from asymmetric_topotein import AsymmetricTopoNet
         model = AsymmetricTopoNet(scalar_dim=128).to(DEVICE)
     else:
-        from tcpnet_adapter import Topotein
+        from topotein import Topotein
         model = Topotein(scalar_dim=128).to(DEVICE)
     
     model.train()
@@ -279,9 +333,71 @@ def run_profiler(model_type, task, batch_size, dataset_size=None):
     prof.export_chrome_trace(trace_file)
     print(f"\nTrace saved to {trace_file}. Open in chrome://tracing to view.")
 
+def _cli_has(*flags):
+    """Whether the user passed one of these flag spellings on the command line
+    (so the --deltafold preset never clobbers an explicit choice)."""
+    return any(a == f or a.startswith(f + '=') for a in sys.argv for f in flags)
+
+
+def _configure_cuda_perf():
+    """Turn on the Ada/L40S throughput levers: TF32 for fp32 matmuls (big speedup,
+    negligible precision loss vs the equivariance tolerances), and cudnn autotuning
+    (safe because bucket-padding keeps the set of tensor shapes small)."""
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+    try:
+        torch.set_float32_matmul_precision('high')
+    except Exception:
+        pass
+
+
+# --deltafold hardware preset for the L40S box (1x NVIDIA L40S 46GB, Xeon 96T,
+# ~981GiB RAM): trade the MPS/16GB-Mac safety limits for CUDA throughput. Each
+# entry maps an args attribute to (preset value, CLI spellings that mean "user set
+# it"); a knob is only overridden when the user did NOT pass it explicitly.
+_DELTAFOLD_PRESET = {
+    # Big VRAM -> pack far more residues per step (MPS default was 1200/1800).
+    'max_residues':   (8000,  ['--max-residues']),
+    'min_residues':   (6000,  ['--min-residues']),
+    # More proteins per batch => more in-batch InfoNCE negatives (count cap; the
+    # residue budget usually binds first). Raise --batch_size further if VRAM allows.
+    'batch_size':     (128,   ['--batch_size']),
+    # The RSS governor + per-step empty_cache exist to protect a 16GB unified-memory
+    # Mac; on a 1TB CUDA box they only cost throughput (and the 14GB hard cap would
+    # falsely trip cold-restarts). Disable them.
+    'cleanup_every':  (0,     ['--cleanup-every']),
+    'mem_soft_gb':    (0.0,   ['--mem-soft-gb']),
+    'mem_hard_gb':    (0.0,   ['--mem-hard-gb']),
+    'no_budget_adapt': (True, ['--no-budget-adapt']),
+    # 96 hardware threads + 1TB RAM: parallel .pt loading with pinned host buffers.
+    'num_workers':    (16,    ['--num-workers']),
+}
+
+
+def _apply_deltafold_preset(args):
+    applied = {}
+    for attr, (val, flags) in _DELTAFOLD_PRESET.items():
+        if not _cli_has(*flags):
+            setattr(args, attr, val)
+            applied[attr] = val
+    return applied
+
+
 def main():
     parser = argparse.ArgumentParser(description="Deltafold Modular Training")
-    parser.add_argument('--model', type=str, choices=['topotein', 'asymmetric'], default='topotein')
+    parser.add_argument('--model', type=str, choices=['topotein', 'asymmetric', 'equivariant'], default='equivariant',
+                        help="topotein=vendored TCPNet; asymmetric=invariant AsymmetricTopoNet; "
+                             "equivariant=EquivariantTopoNet (SE(3)/O(3), plan §F; use --scalarize/--vector-dim).")
+    # --- topotein/tcpnet architecture cost knobs (None = use the config default) ---
+    # These change the model shape, so a checkpoint trained with them must be
+    # extracted with the same values; they're saved in the checkpoint's model_config.
+    parser.add_argument('--num-layers', dest='num_layers', type=int, default=None, help="[topotein] GCP message-passing depth (config default 6). Compute is ~linear in this; 4 or 3 give the biggest cheap speedup.")
+    parser.add_argument('--emb-dim', dest='emb_dim', type=int, default=None, help="[topotein] Hidden width (config default 128). All sub-dims derive from it; keep a multiple of 128 (e.g. 128/256) or instantiation errors on the vector-dim divisibility constraint.")
+    parser.add_argument('--knn', dest='knn', type=int, default=None, help="[topotein] k nearest-neighbour edges per node (config default 16). Edge-attention cost scales with edges, so knn 8 ~halves the per-layer edge work.")
+    parser.add_argument('--num-message-layers', dest='num_message_layers', type=int, default=None, help="[topotein] GCP sub-layers inside each message step (config default 4).")
+    parser.add_argument('--num-feedforward-layers', dest='num_feedforward_layers', type=int, default=None, help="[topotein] feed-forward sub-layers per block (config default 2).")
+    parser.add_argument('--no-typecheck', dest='disable_typecheck', action='store_true', help="[topotein] Disable the workshop's per-call jaxtyping/beartype shape checks (sets JAXTYPING_DISABLE=1). A few %% faster; only do this once the model is known-good.")
     parser.add_argument('--task', type=str, choices=['mtm', 'contrastive'], default='contrastive')
     parser.add_argument('--epochs', type=int, default=30)
     parser.add_argument('--batch_size', type=int, default=16)
@@ -299,13 +415,13 @@ def main():
     parser.add_argument('--hard-neg-beta', dest='hard_neg_beta', type=float, default=0.0, help="Hard-negative reweighting strength for InfoNCE (0=off; report 7).")
     parser.add_argument('--hard-neg-mining', dest='hard_neg_mining', action='store_true', help="Build batches of length/SSE-matched proteins so negatives are superficially similar but topologically distinct (report 7 #1).")
     parser.add_argument('--cleanup-every', dest='cleanup_every', type=int, default=10, help="Run MPS gc/empty_cache every N steps (default 50; 0 disables per-step cleanup). Lower = less peak RAM but much slower on MPS.")
-    parser.add_argument('--max-residues', dest='max_residues', type=int, default=3500, help="With --hard-neg-mining, cap ORIGINAL residues per batch (forward sees ~1.75x after 2 views). Default 4000 keeps batches off the MPS memory-swap cliff. Lower = lighter/faster steps.")
+    parser.add_argument('--max-residues', dest='max_residues', type=int, default=3000, help="Cap ORIGINAL residues per batch (forward sees ~1.75x after 2 views). Batches are packed by residue budget, not protein count, so a few large proteins can't blow up memory. Default is model-aware: ~1800 for the equivariant topotein/tcpnet model (heavy edge/SSE attention on MPS), ~3500 for asymmetric. Lower = lighter/faster steps.")
     parser.add_argument('--no-pad-buckets', dest='pad_buckets', action='store_false', help="Disable bucket-padding of batch shapes. Padding bounds the number of distinct MPS kernels (avoids per-epoch slowdown from kernel-cache bloat); only disable for debugging.")
     parser.add_argument('--mem-soft-gb', dest='mem_soft_gb', type=float, default=11.0, help="Soft RSS cap (GB): above this, force an off-schedule gc+empty_cache every step. 0 disables the governor's pressure logic.")
     parser.add_argument('--mem-hard-gb', dest='mem_hard_gb', type=float, default=14.0, help="Hard RSS cap (GB): above this (after a reclaim attempt), cold-restart DataLoader workers and shrink the residue budget. Keeps headroom below the 16GB swap cliff. 0 disables.")
-    parser.add_argument('--min-residues', dest='min_residues', type=int, default=3500, help="Floor for the dynamic residue-budget shrink under memory pressure.")
+    parser.add_argument('--min-residues', dest='min_residues', type=int, default=3000, help="Floor for the dynamic residue-budget shrink under memory pressure. Default is model-aware (~1200 for topotein/tcpnet, ~3500 for asymmetric).")
     parser.add_argument('--no-budget-adapt', dest='no_budget_adapt', action='store_true', help="Disable dynamic residue-budget shrink under memory pressure (keeps cold restarts).")
-    parser.add_argument('--split', type=str, choices=['cluster', 'phylo'], default='phylo', help="Train/val split: cluster-aware or phylogenetic by taxid (report 7).")
+    parser.add_argument('--split', type=str, choices=['cluster', 'phylo', 'corrected'], default='phylo', help="Train/val split: cluster-aware, phylogenetic by taxid (report 7), or 'corrected' = the bias-corrected prototyping sub-base from scripts/utilities/build_corrected_subbase.py (plan v2 §4; reads data/subbase_corrected_{train,val}.txt). Use without --downsampled.")
     parser.add_argument('--tm-aux-weight', dest='tm_aux_weight', type=float, default=0.0, help="Weight of the TM-score regression auxiliary loss (0=off; report 7/3.4).")
     parser.add_argument('--unsupervised', dest='unsupervised', action='store_true', help="Use plain InfoNCE instead of cluster-label SupCon (avoids taxonomic label leakage, report 4.1).")
     # --- TM-score analysis fixes (tm_score_analysis.md §5) ---
@@ -325,9 +441,56 @@ def main():
                         help="Geometric attention-bias strength -gamma*distance (§5.4; 0 disables). asymmetric only.")
     parser.add_argument('--no-detach-h3', dest='no_detach_h3', action='store_true',
                         help="Disable detaching the per-layer h3 global update; keep the shortcut gradient (§5.7).")
+    parser.add_argument('--dist-encoding', dest='dist_encoding', type=str,
+                        choices=['sinusoidal', 'rbf'], default='rbf',
+                        help="Rank-1 distance encoding (§1, Mod 1): 'sinusoidal' (original) or 'rbf' "
+                             "(Gaussian radial bases, calibrated to the contact scale). asymmetric only.")
+    parser.add_argument('--rbf-dim', dest='rbf_dim', type=int, default=16,
+                        help="Number of Gaussian RBF channels when --dist-encoding rbf (default 16; try 32).")
+    parser.add_argument('--temperature', dest='temperature', type=float, default=0.1,
+                        help="InfoNCE temperature tau (§5 axis B sweep; MoCo plan default 0.2).")
+    parser.add_argument('--objective', type=str, choices=['infonce', 'moco'], default='infonce',
+                        help="Contrastive objective (plan_impl_3): 'infonce' (jitter views) or "
+                             "'moco' (substructure positives + momentum queue + projection head).")
+    parser.add_argument('--moco-k', dest='moco_k', type=int, default=8192, help="MoCo negative-queue length.")
+    parser.add_argument('--moco-m', dest='moco_m', type=float, default=0.99, help="MoCo key-encoder EMA momentum.")
+    parser.add_argument('--sub-f-lo', dest='sub_f_lo', type=float, default=0.4, help="Substructure size fraction, low.")
+    parser.add_argument('--sub-f-hi', dest='sub_f_hi', type=float, default=0.7, help="Substructure size fraction, high.")
+    parser.add_argument('--sub-mode', dest='sub_mode', type=str, choices=['contiguous', 'ball'],
+                        default='contiguous', help="Substructure sampling mode.")
+    parser.add_argument('--scalarize', dest='scalarize', type=str, choices=['frame', 'norm'], default='frame',
+                        help="[equivariant] 'frame'=GCP SE(3)+chiral (default), 'norm'=GVP O(3) (plan §F ablation).")
+    parser.add_argument('--vector-dim', dest='vector_dim', type=int, default=16,
+                        help="[equivariant/topotein] vector channels per cell (default 16; use 8 for memory, esp. with MoCo).")
+    parser.add_argument('--deltafold', action='store_true',
+                        help="Run on the CUDA `deltafold` box (1x NVIDIA L40S 46GB, Xeon 96T, ~1TB RAM): "
+                             "force the CUDA device (pins one GPU via CUDA_VISIBLE_DEVICES=0), enable "
+                             "TF32/cudnn autotune, and apply a high-throughput preset (larger residue "
+                             "budget + batch, more DataLoader workers, RSS memory-governor disabled). "
+                             "Any of those knobs passed explicitly still wins.")
+    parser.add_argument('--num-workers', dest='num_workers', type=int, default=None,
+                        help="DataLoader worker processes for the train loader (default: cpu_count//2; "
+                             "the --deltafold preset uses 16). Val always uses 0.")
+    parser.add_argument('--tensor-diagram', dest='tensor_diagram', type=str, default='default',
+                        help="[topotein] Message-passing order/channels (protocol §Modular ordering): "
+                             "'default' (Topotein 4-step), 'residue_hub' (no inter-SSE outer-edge channel), "
+                             "'no_rank3' (drop the protein cell), 'reordered', or a custom comma-separated "
+                             "step order e.g. 'edge,node,sse,protein'.")
+    parser.add_argument('--readout', dest='readout', type=str, choices=['node', 'protein'], default='node',
+                        help="[topotein] Graph readout (protocol §Readout): 'node' pooling (default) or "
+                             "the rank-3 'protein' cell.")
     args = parser.parse_args()
+
+    if args.deltafold:
+        _configure_cuda_perf()
+        applied = _apply_deltafold_preset(args)
+        props = torch.cuda.get_device_properties(0)
+        print(f"[--deltafold] CUDA on {props.name} ({props.total_memory / 1e9:.0f} GB, "
+              f"visible GPU(s)={os.environ.get('CUDA_VISIBLE_DEVICES', 'all')}); TF32+cudnn.benchmark on.")
+        print(f"[--deltafold] preset overrides (explicit flags win): {applied}")
+
     print(f"Dataset size: {args.dataset_size if args.dataset_size else 'Full'}")
-    
+
     if args.cprofile:
         profiler = cProfile.Profile()
         profiler.enable()
@@ -360,11 +523,31 @@ def main():
             edge_attn_softmax=not args.no_softmax_edge,
             dist_bias_gamma=args.dist_bias_gamma,
             detach_h3=not args.no_detach_h3,
+            dist_encoding=args.dist_encoding,
+            rbf_dim=args.rbf_dim,
+            temperature=args.temperature,
+            objective=args.objective,
+            moco_k=args.moco_k,
+            moco_m=args.moco_m,
+            sub_f_lo=args.sub_f_lo,
+            sub_f_hi=args.sub_f_hi,
+            sub_mode=args.sub_mode,
+            scalarize=args.scalarize,
+            vector_dim=args.vector_dim,
+            tensor_diagram=args.tensor_diagram,
+            readout=args.readout,
+            num_workers=args.num_workers,
             mem_soft_gb=args.mem_soft_gb,
             mem_hard_gb=args.mem_hard_gb,
             min_residues=args.min_residues,
             no_budget_adapt=args.no_budget_adapt,
             downsampled=args.downsampled,
+            num_layers=args.num_layers,
+            emb_dim=args.emb_dim,
+            knn=args.knn,
+            num_message_layers=args.num_message_layers,
+            num_feedforward_layers=args.num_feedforward_layers,
+            disable_typecheck=args.disable_typecheck,
         )
 
     if args.cprofile:

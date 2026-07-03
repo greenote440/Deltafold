@@ -13,11 +13,12 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
-from tcpnet_adapter import Topotein
+from topotein import Topotein
 from asymmetric_topotein import AsymmetricTopoNet
 from train import PCCDataset, custom_collate, to_device, get_cluster_aware_split, DEVICE, PROC_DIR, CHECKPOINT_DIR, CLUSTER_TSV
 
-DEVICE = torch.device('mps' if torch.backends.mps.is_available() else ('cuda' if torch.cuda.is_available() else 'cpu'))
+# DEVICE is imported from train (honours --deltafold / DELTAFOLD_DEVICE); don't
+# recompute it here or the forced-CUDA pin would be lost.
 PROC_DIR = './data/hoan_processed'
 CHECKPOINT_DIR = './checkpoints'
 CLUSTER_TSV = './data/cluster.tsv'

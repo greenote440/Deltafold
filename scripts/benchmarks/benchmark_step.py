@@ -37,7 +37,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from train import get_split, PCCDataset, to_device, DEVICE, PROC_DIR, CLUSTER_TSV, CHECKPOINT_DIR
 from contrastive_engine import StructuralAugmentations, NTXentLoss
 from asymmetric_topotein import AsymmetricTopoNet
-from tcpnet_adapter import Topotein
+from topotein import Topotein
 from train_contrastive import (contrastive_collate, extract_batch_keys,
                                HardNegativeBatchSampler, worker_init_fn, pad_to_buckets)
 

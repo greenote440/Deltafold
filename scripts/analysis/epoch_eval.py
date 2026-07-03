@@ -56,6 +56,22 @@ def _l2(X):
     return X / (np.linalg.norm(X, axis=1, keepdims=True) + 1e-12)
 
 
+def decollapse(X, mode='none'):
+    """De-collapse an embedding set with a FIXED (no-training) linear transform so
+    metrics reflect information rather than a random/near-collapse mean direction.
+    'center' removes the shared mean direction; 'pca' additionally whitens
+    (decorrelate + unit variance). Spearman TM-rho is ~unchanged by this (it is
+    rank-based), but recall/ARI stop being collapse-inflated."""
+    X = np.asarray(X, dtype=np.float64)
+    if mode in ('center', 'pca'):
+        Xc = X - X.mean(axis=0, keepdims=True)
+        if mode == 'center':
+            return Xc
+        U, S, Vt = np.linalg.svd(Xc, full_matrices=False)
+        return Xc @ Vt.T / (S / np.sqrt(len(Xc)) + 1e-8)
+    return X
+
+
 def _mutual_multimember_ari_nmi(model_labels, fs_labels):
     """ARI/NMI restricted to proteins whose model AND Foldseek clusters are both
     multi-member (singletons make the comparison ill-posed). Mirrors compare_clusters.py."""
@@ -90,8 +106,83 @@ def _relabel_singletons(labels):
     return out
 
 
+def _health_metrics(X, max_pairs=1000, seed=0):
+    """§6.1 collapse/health gate (plan v2) — the BLOCKING metrics.
+
+      effective_rank : Roy–Vetterli effective rank exp(-Σ p_i log p_i) of the
+                       embedding singular-value spectrum (p_i = s_i/Σs). ~D = full
+                       use of the space; ~1 = (near-)dimensional collapse.
+      emb_std        : mean per-dimension std (low -> collapse).
+      mean_cos       : mean off-diagonal cosine (high -> collapse).
+      uniformity     : Wang & Isola log E[exp(-2‖z_i-z_j‖²)] over random pairs;
+                       more negative = better spread (anti-collapse). `[alignunif]`
+    X is L2-normalized (N, D)."""
+    N = X.shape[0]
+    Xc = X - X.mean(0, keepdims=True)
+    s = np.linalg.svd(Xc, compute_uv=False)
+    p = s / (s.sum() + 1e-12)
+    eff_rank = float(np.exp(-(p * np.log(p + 1e-12)).sum()))
+    emb_std = float(X.std(0).mean())
+    rng = np.random.default_rng(seed)
+    idx = rng.choice(N, max_pairs, replace=False) if N > max_pairs else np.arange(N)
+    Xs = X[idx]
+    gram = Xs @ Xs.T
+    iu = np.triu_indices(len(Xs), k=1)
+    sq = np.maximum(0.0, 2.0 - 2.0 * gram[iu])          # ‖a-b‖² for unit vectors
+    uniformity = float(np.log(np.mean(np.exp(-2.0 * sq)) + 1e-12))
+    mean_cos = float(gram[iu].mean())
+    return {'effective_rank': round(eff_rank, 3), 'emb_std': round(emb_std, 4),
+            'mean_cos': round(mean_cos, 4), 'uniformity': round(uniformity, 4)}
+
+
+def _clustering_metrics(model_labels, fs_labels, n_perm=5, seed=0):
+    """ARI/NMI + Mod 4 directional agreement (V-measure / homogeneity / completeness
+    / Fowlkes–Mallows, fragmentation/fusion) + Mod 3 permutation-null ARI, all on the
+    subset where model AND Foldseek clusters are both multi-member."""
+    from collections import Counter, defaultdict
+    mc, fc = Counter(model_labels), Counter(fs_labels)
+    keep = [i for i in range(len(model_labels))
+            if mc[model_labels[i]] >= 2 and fc[fs_labels[i]] >= 2]
+    nan = float('nan')
+    if len(keep) < 2:
+        return {'hdbscan_ari': nan, 'hdbscan_nmi': nan, 'homogeneity': nan,
+                'completeness': nan, 'v_measure': nan, 'fowlkes_mallows': nan,
+                'fragmentation': nan, 'fusion': nan, 'perm_ari': nan, 'n_eval': 0}
+    ml = [model_labels[i] for i in keep]
+    fl = [fs_labels[i] for i in keep]
+    from sklearn.metrics import (adjusted_rand_score, normalized_mutual_info_score,
+                                 homogeneity_score, completeness_score, v_measure_score,
+                                 fowlkes_mallows_score)
+    # Mod 4 fragmentation (Foldseek cluster split across model clusters) / fusion (inverse)
+    f2m, m2f = defaultdict(set), defaultdict(set)
+    for a, b in zip(fl, ml):
+        f2m[a].add(b); m2f[b].add(a)
+    frag = sum(len(v) for v in f2m.values()) / len(f2m)
+    fus = sum(len(v) for v in m2f.values()) / len(m2f)
+    # Mod 3 permutation-null ARI: shuffle the Foldseek labels (preserves marginal
+    # cluster sizes) -> calibrated ARI floor. ARI_real - perm_ari = label contribution.
+    rng = np.random.default_rng(seed)
+    fl_arr = np.array(fl)
+    perm = float(np.mean([adjusted_rand_score(rng.permutation(fl_arr), ml) for _ in range(n_perm)]))
+    return {
+        'hdbscan_ari': round(adjusted_rand_score(fl, ml), 4),
+        'hdbscan_nmi': round(normalized_mutual_info_score(fl, ml), 4),
+        'homogeneity': round(homogeneity_score(fl, ml), 4),
+        'completeness': round(completeness_score(fl, ml), 4),
+        'v_measure': round(v_measure_score(fl, ml), 4),
+        'fowlkes_mallows': round(fowlkes_mallows_score(fl, ml), 4),
+        'fragmentation': round(frag, 3), 'fusion': round(fus, 3),
+        'perm_ari': round(perm, 4), 'n_eval': len(keep),
+    }
+
+
 def evaluate(embs, ids, foldseek_labels, tm_cache=None, tm_cache_path='./checkpoints/tm_score_cache.pt',
-             min_cluster_size=2, min_samples=1, close_threshold=0.45):
+             min_cluster_size=2, min_samples=None, close_threshold=0.45, whiten='none'):
+    # NOTE: min_samples=None lets HDBSCAN use its default (= min_cluster_size). The
+    # old default min_samples=1 over-fragments hard (every point joins a tiny
+    # cluster), which crushed ARI and masked real differences — e.g. ep24 ARI went
+    # 0.27 (ms=1) -> 0.68 (ms=None), and the training-vs-baseline gain only shows
+    # at ms=None. Pass min_samples=1 explicitly only to reproduce old logged values.
     """Cluster `embs` with HDBSCAN (euclidean over L2-normalised vectors -- the scalable,
     pipeline-consistent metric) and score against `foldseek_labels`; plus TM-correlation.
 
@@ -101,7 +192,7 @@ def evaluate(embs, ids, foldseek_labels, tm_cache=None, tm_cache_path='./checkpo
     Returns a metrics dict.
     """
     import hdbscan
-    X = _l2(np.asarray(embs, dtype=np.float64))
+    X = _l2(decollapse(embs, whiten))     # optional fixed de-collapse before metrics
     N = X.shape[0]
 
     labels = hdbscan.HDBSCAN(
@@ -112,7 +203,10 @@ def evaluate(embs, ids, foldseek_labels, tm_cache=None, tm_cache_path='./checkpo
     singleton_frac = float((labels < 0).mean())
     n_clusters = int(len({int(l) for l in labels if l >= 0}))
 
-    ari, nmi, n_eval = _mutual_multimember_ari_nmi(list(labels), list(foldseek_labels))
+    # §6.1 health gate (blocking) + Mod 3/4 clustering agreement.
+    health = _health_metrics(X)
+    clu = _clustering_metrics(list(labels), list(foldseek_labels))
+    n_eval = clu['n_eval']
 
     # --- TM correlation / homology recall over cached pairs present in this set ---
     if tm_cache is None:
@@ -129,6 +223,7 @@ def evaluate(embs, ids, foldseek_labels, tm_cache=None, tm_cache_path='./checkpo
     dists, tms = np.array(dists), np.array(tms)
     tm_rho = float('nan')
     tm_recall = float('nan')
+    tm_alignment = float('nan')          # §6.1 alignment over structural positives
     n_pairs = int(len(dists))
     if n_pairs >= 5:
         from scipy.stats import spearmanr
@@ -136,20 +231,30 @@ def evaluate(embs, ids, foldseek_labels, tm_cache=None, tm_cache_path='./checkpo
         cross = tms > 0.5
         if cross.sum() > 0:
             tm_recall = float((dists[cross] < close_threshold).mean())
+            # alignment = E‖z_i-z_j‖² over high-TM (positive) pairs = 2*(1-cos); lower=better.
+            tm_alignment = float(np.mean(2.0 * dists[cross]))
 
-    return {
+    out = {
         'n': N, 'n_clusters': n_clusters, 'singleton_frac': round(singleton_frac, 4),
-        'hdbscan_ari': round(ari, 4) if ari == ari else float('nan'),
-        'hdbscan_nmi': round(nmi, 4) if nmi == nmi else float('nan'),
         'n_eval': n_eval,
         'tm_rho': round(tm_rho, 4) if tm_rho == tm_rho else float('nan'),
         'tm_recall': round(tm_recall, 4) if tm_recall == tm_recall else float('nan'),
+        'tm_alignment': round(tm_alignment, 4) if tm_alignment == tm_alignment else float('nan'),
         'n_tm_pairs': n_pairs,
     }
+    out.update(health)    # effective_rank, emb_std, mean_cos, uniformity
+    out.update(clu)       # hdbscan_ari/nmi, homogeneity, completeness, v_measure,
+                          # fowlkes_mallows, fragmentation, fusion, perm_ari (+ n_eval)
+    return out
 
 
-_FIELDS = ['epoch', 'n', 'n_clusters', 'singleton_frac', 'hdbscan_ari', 'hdbscan_nmi',
-           'n_eval', 'tm_rho', 'tm_recall', 'n_tm_pairs']
+_FIELDS = ['epoch', 'n', 'n_clusters', 'singleton_frac', 'n_eval',
+           'tm_rho', 'tm_recall', 'tm_alignment', 'n_tm_pairs',
+           # §6.1 health gate
+           'effective_rank', 'emb_std', 'mean_cos', 'uniformity',
+           # Mod 3/4 clustering agreement
+           'hdbscan_ari', 'hdbscan_nmi', 'homogeneity', 'completeness', 'v_measure',
+           'fowlkes_mallows', 'fragmentation', 'fusion', 'perm_ari']
 
 
 def log_row(csv_path, epoch, metrics):
@@ -164,9 +269,13 @@ def log_row(csv_path, epoch, metrics):
 
 def format_line(metrics):
     m = metrics
-    return (f"HDBSCAN-ARI={m['hdbscan_ari']} NMI={m['hdbscan_nmi']} "
-            f"({m['n_clusters']} clusters, {m['singleton_frac']:.0%} singletons, n_eval={m['n_eval']}) | "
-            f"TM-rho={m['tm_rho']} recall@close={m['tm_recall']} ({m['n_tm_pairs']} pairs)")
+    g = lambda k: m.get(k, '?')
+    return (f"TM-rho={g('tm_rho')} recall={g('tm_recall')} align={g('tm_alignment')} "
+            f"({g('n_tm_pairs')} pairs) | health: eff_rank={g('effective_rank')} "
+            f"emb_std={g('emb_std')} mean_cos={g('mean_cos')} unif={g('uniformity')} | "
+            f"ARI={g('hdbscan_ari')} (perm {g('perm_ari')}) Vm={g('v_measure')} "
+            f"FM={g('fowlkes_mallows')} frag={g('fragmentation')} fus={g('fusion')} "
+            f"[{g('n_clusters')} cl, {m.get('singleton_frac', 0):.0%} singl, n_eval={g('n_eval')}]")
 
 
 def main():
@@ -177,23 +286,36 @@ def main():
     ap.add_argument('--min-cluster-size', type=int, default=2)
     ap.add_argument('--log', default=None, help="Optional CSV to append the result to.")
     ap.add_argument('--epoch', default='full', help="Epoch label for the logged row.")
+    ap.add_argument('--whiten', choices=['none', 'center', 'pca'], default='none',
+                    help="De-collapse the embeddings with a fixed transform before metrics "
+                         "(center / PCA-whiten). Use for non-collapsed baselines so recall/ARI "
+                         "aren't collapse-inflated. TM-rho is ~unchanged (rank-based).")
+    ap.add_argument('--cluster-source', choices=['foldseek', 'nomburg'], default='nomburg',
+                    help="Ground-truth cluster labels to score against. 'nomburg' uses the "
+                         "18k merged clusters from merged_clusters.tax.tsv (the Nomburg study "
+                         "final set). 'foldseek' uses the raw FoldSeek pairwise cluster.tsv.")
     args = ap.parse_args()
 
     import cluster_common as cc
     ids, X = cc.load_embeddings(args.emb)
-    rep_of = cc.load_foldseek_clusters() if hasattr(cc, 'load_foldseek_clusters') else None
-    if rep_of is None:
-        # fall back to cluster.tsv via load_cluster_tsv-style rep map
-        rep_of = {}
-        if os.path.exists(cc.CLUSTER_TSV):
-            with open(cc.CLUSTER_TSV) as f:
-                for line in f:
-                    c = line.rstrip('\n').split('\t')
-                    if len(c) >= 2:
-                        rep_of[c[1]] = c[0]
+    if args.cluster_source == 'nomburg':
+        rep_of = cc.load_nomburg_clusters()
+        print(f"  cluster source: Nomburg merged ({len(set(rep_of.values()))} clusters)")
+    else:
+        rep_of = cc.load_foldseek_clusters() if hasattr(cc, 'load_foldseek_clusters') else None
+        if rep_of is None:
+            rep_of = {}
+            if os.path.exists(cc.CLUSTER_TSV):
+                with open(cc.CLUSTER_TSV) as f:
+                    for line in f:
+                        c = line.rstrip('\n').split('\t')
+                        if len(c) >= 2:
+                            rep_of[c[1]] = c[0]
+        print(f"  cluster source: FoldSeek pairwise ({len(set(rep_of.values()))} clusters)")
     fs_labels = [rep_of.get(i, i) for i in ids]
-    print(f"{len(ids)} embeddings | evaluating ...")
-    m = evaluate(X, ids, fs_labels, tm_cache_path=args.tm_cache, min_cluster_size=args.min_cluster_size)
+    print(f"{len(ids)} embeddings | evaluating (whiten={args.whiten}) ...")
+    m = evaluate(X, ids, fs_labels, tm_cache_path=args.tm_cache,
+                 min_cluster_size=args.min_cluster_size, whiten=args.whiten)
     print(format_line(m))
     if args.log:
         log_row(args.log, args.epoch, m)

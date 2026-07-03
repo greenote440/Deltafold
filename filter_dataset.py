@@ -1,3 +1,19 @@
+"""
+DEPRECATED downsampler — kept for provenance only.
+
+``refine_subdataset_by_clustering`` below produced the biased prototyping base
+``data/subdataset_files_refined.txt`` (3 647 proteins) whose four biases are
+catalogued in plan_experimentation_v2 §4: singletons removed (multi-member only),
+size distribution flattened ("max 2 per cluster"), hand-picked folds (the
+``target_keywords`` list), and selection⇄evaluation entanglement (those keyword
+proteins are the downstream test cases).
+
+Use ``scripts/utilities/build_corrected_subbase.py`` instead — it corrects all
+four (proportional sampling, singletons kept, keyword-blind selection with
+separate controls, cold cluster split + dedup) and writes
+``data/subbase_corrected_{train,val,controls}.txt``, consumed in training via
+``--split corrected`` (see ``train.get_corrected_split``).
+"""
 import re
 import json
 import tqdm

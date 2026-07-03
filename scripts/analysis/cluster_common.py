@@ -20,6 +20,7 @@ import torch
 
 EMB_FILE = './data/virome_embeddings.pt'
 CLUSTER_TSV = './data/cluster.tsv'
+NOMBURG_CLUSTERS_TSV = './code_and_intermediate_data/intermediate_data/merged_clusters.tax.tsv'
 SUBDATASET_FILES = './data/subdataset_files.txt'
 TM_CACHE = './checkpoints/tm_score_cache.pt'
 OUT_DIR = './clusters'
@@ -148,6 +149,25 @@ def load_foldseek_clusters(path=CLUSTER_TSV):
                 continue
             rep, member = strip_ext(cols[0]), strip_ext(cols[1])
             rep_of[member] = rep
+    return rep_of
+
+
+def load_nomburg_clusters(path=NOMBURG_CLUSTERS_TSV):
+    """member id -> Nomburg cluster ID (str), from merged_clusters.tax.tsv.
+    Column layout (0-indexed): cluster_ID, cluster_rep, subcluster_rep, cluster_member, ...
+    First two rows are header rows and are skipped.
+    """
+    rep_of = {}
+    with open(path) as f:
+        for i, line in enumerate(f):
+            if i < 2:
+                continue
+            cols = line.rstrip('\n').split('\t')
+            if len(cols) < 4:
+                continue
+            cluster_id = cols[0]
+            member = strip_ext(cols[3])
+            rep_of[member] = cluster_id
     return rep_of
 
 

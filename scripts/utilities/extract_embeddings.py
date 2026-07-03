@@ -28,7 +28,7 @@ import argparse
 from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
-from tcpnet_adapter import Topotein
+from topotein import Topotein
 from train import custom_collate, to_device
 from train_contrastive import pad_to_buckets, extract_batch_keys, free_memory, worker_init_fn
 
@@ -119,8 +119,19 @@ class LengthBudgetSampler(Sampler):
 
 def extract_embeddings(model_type='topotein', task='contrastive', batch_size=32,
                        max_residues=8000, cleanup_every=50, pad_buckets=True,
-                       checkpoint=None, output=None, downsampled=False):
-    files = _downsampled_files() if downsampled else None
+                       checkpoint=None, output=None, downsampled=False, file_list=None):
+    if file_list:
+        files = []
+        for fl in file_list:
+            with open(fl) as fh:
+                for ln in fh:
+                    ln = ln.strip()
+                    if ln:
+                        files.append(ln if os.path.isabs(ln) or os.path.exists(ln)
+                                     else os.path.join(PROC_DIR, os.path.basename(ln)))
+        print(f"File-list mode: {len(files)} proteins from {len(file_list)} manifest(s)")
+    else:
+        files = _downsampled_files() if downsampled else None
     dataset = ExtractionDataset(PROC_DIR, files=files)
     if downsampled:
         print(f"Downsampled mode: {len(dataset)} proteins")
@@ -175,6 +186,9 @@ def extract_embeddings(model_type='topotein', task='contrastive', batch_size=32,
     if model_type == 'asymmetric':
         from asymmetric_topotein import AsymmetricTopoNet
         model = AsymmetricTopoNet(scalar_dim=128, **model_config).to(DEVICE)
+    elif model_type == 'equivariant':
+        from equivariant_topotein import EquivariantTopoNet
+        model = EquivariantTopoNet(scalar_dim=128, **model_config).to(DEVICE)
     else:
         model = Topotein(scalar_dim=128, **model_config).to(DEVICE)
     model.load_state_dict(checkpoint['model_state_dict'])
@@ -222,7 +236,7 @@ def extract_embeddings(model_type='topotein', task='contrastive', batch_size=32,
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Deltafold Embedding Extraction")
-    parser.add_argument('--model', type=str, choices=['topotein', 'asymmetric'], default='topotein')
+    parser.add_argument('--model', type=str, choices=['topotein', 'asymmetric', 'equivariant'], default='topotein')
     parser.add_argument('--task', type=str, choices=['mtm', 'contrastive'], default='contrastive')
     parser.add_argument('--batch_size', type=int, default=64, help="Hard upper bound on proteins per batch (the residue budget usually binds first).")
     parser.add_argument('--max-residues', dest='max_residues', type=int, default=16000, help="Cap residues per batch. Forward-only, so this maps ~directly to in-forward residues; safe above training's 4000 (which sees ~1.75x after 2 views + backward). Keeps batches off the MPS swap cliff.")
@@ -231,10 +245,11 @@ if __name__ == "__main__":
     parser.add_argument('--emb', dest='checkpoint', type=str, default=None, help="Path to a specific checkpoint .pth file to load (overrides the default best-checkpoint lookup).")
     parser.add_argument('--out', type=str, default=None, help="Output path for the embeddings .pt file (default: data/virome_embeddings.pt).")
     parser.add_argument('--downsampled', action='store_true', help=f"Only extract the {DOWNSAMPLED_DATASET_SIZE + int(DOWNSAMPLED_DATASET_SIZE * 0.25)} proteins used in the downsampled training run (reconstructed from the same deterministic cluster-aware split, seed=42).")
+    parser.add_argument('--file-list', nargs='*', default=None, help="One or more manifest files (e.g. the corrected sub-base data/subbase_corrected_{train,val}.txt) to restrict extraction to those proteins.")
 
     args = parser.parse_args()
 
     extract_embeddings(model_type=args.model, task=args.task, batch_size=args.batch_size,
                        max_residues=args.max_residues, cleanup_every=args.cleanup_every,
                        pad_buckets=args.pad_buckets, checkpoint=args.checkpoint,
-                       output=args.out, downsampled=args.downsampled)
+                       output=args.out, downsampled=args.downsampled, file_list=args.file_list)

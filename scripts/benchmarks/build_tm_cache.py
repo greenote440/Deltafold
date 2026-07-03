@@ -27,6 +27,8 @@ import random
 from itertools import combinations
 
 import numpy as np
+import multiprocessing as mp
+
 import torch
 from tqdm import tqdm
 
@@ -61,9 +63,13 @@ def load_struct(pt_path):
         return None, None
 
 
-def build_clusters(proc_dir, cluster_tsv):
+def build_clusters(proc_dir, cluster_tsv, restrict=None):
     """Group the .pt files actually present in proc_dir by their Foldseek cluster
-    representative. Returns (clusters: {rep -> [basename,...]}, basenames: [all])."""
+    representative. Returns (clusters: {rep -> [basename,...]}, basenames: [all]).
+
+    ``restrict`` (optional set of basenames) limits the cache to those files —
+    use it to scope the (expensive) TM-align build to the corrected sub-base
+    instead of the full 67k set, whose mega-clusters yield millions of pairs."""
     acc_to_cluster = {}
     if os.path.exists(cluster_tsv):
         with open(cluster_tsv, 'r') as f:
@@ -77,6 +83,8 @@ def build_clusters(proc_dir, cluster_tsv):
     basenames = []
     for f in pt_files:
         bn = os.path.basename(f)
+        if restrict is not None and bn not in restrict:
+            continue
         basenames.append(bn)
         acc = extract_accession(bn)
         rep = acc_to_cluster.get(acc, acc)  # singletons cluster with themselves
@@ -98,6 +106,24 @@ def tm_align_pair(structs, a, b):
         return None
 
 
+# --- Parallel alignment -----------------------------------------------------
+# TM-align is single-threaded per pair, so a serial loop pins one core and
+# leaves the rest idle. The pairs are independent, so fan them out over a process
+# pool. Workers hold the (read-only) structure table in a module global set once
+# by the initializer, so it isn't re-pickled per task.
+_STRUCTS = None
+
+
+def _init_tm_worker(structs):
+    global _STRUCTS
+    _STRUCTS = structs
+
+
+def _align_pair_mp(pair):
+    a, b = pair
+    return pair, tm_align_pair(_STRUCTS, a, b)
+
+
 def main():
     ap = argparse.ArgumentParser(description="Pre-compute pairwise TM-score cache (§5.1).")
     ap.add_argument('--proc-dir', default=PROC_DIR)
@@ -107,7 +133,17 @@ def main():
                     help="Number of random cross-cluster pairs to also align (informative negatives).")
     ap.add_argument('--limit-clusters', type=int, default=None,
                     help="Only process the first N multi-member clusters (smoke test).")
+    ap.add_argument('--file-list', nargs='*', default=None,
+                    help="One or more manifest files (e.g. the corrected sub-base "
+                         "data/subbase_corrected_{train,val}.txt). Restricts the cache to those "
+                         "structures so the build is scoped/cheap instead of the full 67k set.")
     ap.add_argument('--seed', type=int, default=42)
+    ap.add_argument('--workers', type=int, default=0,
+                    help="Parallel TM-align workers (0 = all CPU cores).")
+    ap.add_argument('--max-pairs-per-cluster', type=int, default=0,
+                    help="Cap within-cluster pairs sampled per cluster (0 = all C(n,2)). "
+                         "Bounds the quadratic blow-up of large clusters; e.g. 30 keeps the "
+                         "cache sparse-but-representative for TM-rho/recall eval.")
     args = ap.parse_args()
 
     try:
@@ -117,7 +153,14 @@ def main():
                          "source /opt/homebrew/Caskroom/miniforge/base/etc/profile.d/conda.sh && conda activate ml_env")
 
     random.seed(args.seed)
-    clusters, all_basenames = build_clusters(args.proc_dir, args.cluster_tsv)
+    restrict = None
+    if args.file_list:
+        restrict = set()
+        for fl in args.file_list:
+            with open(fl) as fh:
+                restrict.update(os.path.basename(l.strip()) for l in fh if l.strip())
+        print(f"Restricting to {len(restrict)} structures from {len(args.file_list)} manifest(s).")
+    clusters, all_basenames = build_clusters(args.proc_dir, args.cluster_tsv, restrict=restrict)
     multi = {rep: mem for rep, mem in clusters.items() if len(mem) >= 2}
     multi_reps = sorted(multi.keys())
     if args.limit_clusters is not None:
@@ -142,36 +185,63 @@ def main():
         if ca is not None:
             structs[bn] = (ca, seq)
 
+    # Resume support: reuse any pairs already in the output file so a re-run (or a
+    # Ctrl-C'd run) doesn't recompute them.
     cache = {}
+    if os.path.exists(args.out):
+        try:
+            cache = torch.load(args.out, weights_only=False)
+            print(f"Resuming: {len(cache)} pairs already cached in {args.out}.")
+        except Exception:
+            cache = {}
 
-    # --- within-cluster pairs ---
-    for rep in tqdm(multi_reps, desc="Within-cluster TM"):
+    def _is_cached(a, b):
+        return (a, b) in cache or (b, a) in cache
+
+    # Build the full pair list up front, then align in parallel (see _align_pair_mp).
+    # Cap within-cluster pairs per cluster so a few huge clusters don't dominate
+    # (quadratic): randomly sample up to max-pairs-per-cluster of each cluster's pairs.
+    pairs = []
+    for rep in multi_reps:
         members = [m for m in multi[rep] if m in structs]
-        for a, b in combinations(members, 2):
-            tm = tm_align_pair(structs, a, b)
-            if tm is not None:
-                cache[(a, b)] = tm
+        cps = list(combinations(members, 2))
+        if args.max_pairs_per_cluster and len(cps) > args.max_pairs_per_cluster:
+            cps = random.sample(cps, args.max_pairs_per_cluster)
+        pairs.extend(cps)
 
-    # --- optional cross-cluster sample ---
+    # --- optional cross-cluster sample (informative negatives) ---
     if args.cross_samples > 0 and len(all_basenames) > 1:
         bn_to_rep = {bn: rep for rep, mem in clusters.items() for bn in mem}
-        pool = [b for b in all_basenames if b in structs]
-        added, attempts, max_attempts = 0, 0, args.cross_samples * 20
-        pbar = tqdm(total=args.cross_samples, desc="Cross-cluster TM")
+        pool_bns = [b for b in all_basenames if b in structs]
+        seen, added, attempts, max_attempts = set(), 0, 0, args.cross_samples * 50
         while added < args.cross_samples and attempts < max_attempts:
             attempts += 1
-            a, b = random.sample(pool, 2)
+            a, b = random.sample(pool_bns, 2)
             if bn_to_rep.get(a) == bn_to_rep.get(b):
-                continue  # same cluster — already covered above
-            if (a, b) in cache or (b, a) in cache:
+                continue  # same cluster — already a within-cluster pair
+            key = (a, b) if a < b else (b, a)
+            if key in seen:
                 continue
-            tm = tm_align_pair(structs, a, b)
+            seen.add(key); pairs.append((a, b)); added += 1
+        print(f"Sampled {added} cross-cluster pairs ({attempts} attempts).")
+
+    # Drop pairs already cached (resume), then align the rest in parallel.
+    pairs = [(a, b) for (a, b) in pairs if not _is_cached(a, b)]
+    os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
+
+    n_workers = args.workers or os.cpu_count() or 1
+    print(f"Aligning {len(pairs)} pairs across {n_workers} workers"
+          + (f" (cap {args.max_pairs_per_cluster}/cluster)" if args.max_pairs_per_cluster else "")
+          + "...")
+    done = 0
+    with mp.Pool(n_workers, initializer=_init_tm_worker, initargs=(structs,)) as pool:
+        for pair, tm in tqdm(pool.imap_unordered(_align_pair_mp, pairs, chunksize=32),
+                             total=len(pairs), desc="TM-align"):
             if tm is not None:
-                cache[(a, b)] = tm
-                added += 1
-                pbar.update(1)
-        pbar.close()
-        print(f"Added {added} cross-cluster pairs ({attempts} attempts).")
+                cache[pair] = tm
+            done += 1
+            if done % 5000 == 0:        # periodic checkpoint -> resumable on Ctrl-C
+                torch.save(cache, args.out)
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     torch.save(cache, args.out)
