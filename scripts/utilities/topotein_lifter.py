@@ -20,6 +20,11 @@ import deltafold_paths
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 
+# Default device for the MAIN process only; each worker overrides DEVICE from the
+# --device flag in _init_worker. Deliberately does NOT auto-select CUDA here: lifting
+# is CPU-parallel across many workers, and eagerly calling torch.cuda.is_available()
+# at import would spin up a CUDA context in *every* spawn worker. CUDA is opt-in via
+# `--device cuda` (see main()).
 DEVICE = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
 # Data root from deltafold_paths: ./data locally, /data/pnardi under --deltafold.
 BASE_DIR = Path(deltafold_paths.DATA_DIR)
@@ -107,10 +112,14 @@ class TopoteinLifter:
         centered = coords - com
         cov_matrix = (centered.T @ centered) / (coords.shape[0] - 1)
         
-        # torch.linalg.eigh is not yet implemented natively for MPS.
-        # Explicitly compute this step on the CPU and move back to DEVICE.
-        eigenvalues, eigenvectors = torch.linalg.eigh(cov_matrix.cpu())
-        eigenvalues, eigenvectors = eigenvalues.to(DEVICE), eigenvectors.to(DEVICE)
+        # torch.linalg.eigh is not implemented for the MPS backend, so on MPS we run
+        # this (tiny 3x3) decomposition on CPU and move the result back. CUDA and CPU
+        # run it natively.
+        if DEVICE.type == 'mps':
+            eigenvalues, eigenvectors = torch.linalg.eigh(cov_matrix.cpu())
+            eigenvalues, eigenvectors = eigenvalues.to(DEVICE), eigenvectors.to(DEVICE)
+        else:
+            eigenvalues, eigenvectors = torch.linalg.eigh(cov_matrix)
         
         idx = eigenvalues.argsort(descending=True)
         eigenvalues = eigenvalues[idx]
@@ -139,7 +148,11 @@ class TopoteinLifter:
         
         try:
             # 1. Create DB
-            res = subprocess.run(["foldseek", "createdb", pdb_file_path, db_path], 
+            # --threads 1: foldseek defaults to ALL cores, but we already run one
+            # foldseek per worker process (workers ~= cores). Without this, N workers
+            # each spawn a 96-thread foldseek => thousands of threads thrash the box
+            # and throughput collapses (~10 prot/s instead of ~50+).
+            res = subprocess.run(["foldseek", "createdb", pdb_file_path, db_path, "--threads", "1"],
                            capture_output=True, text=True, env=env)
             if res.returncode != 0:
                 logging.error(f"Foldseek createdb failed: {res.stderr}")
@@ -158,7 +171,8 @@ class TopoteinLifter:
             
             # 2. Convert to FASTA
             if os.path.exists(db_path + "_ss"):
-                res = subprocess.run(["foldseek", "convert2fasta", db_path + "_ss", fasta_path], 
+                # convert2fasta is trivial (DB dump) and does NOT accept --threads.
+                res = subprocess.run(["foldseek", "convert2fasta", db_path + "_ss", fasta_path],
                                capture_output=True, text=True, env=env)
                 if res.returncode != 0:
                     logging.error(f"Foldseek convert2fasta failed: {res.stderr}")
@@ -423,10 +437,16 @@ def _init_worker(lift_residue, lift_positional, out_dir, device=None):
     OUT_DIR = Path(out_dir)
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     _WORKER_BATCH_COUNT = 0
+    # Pin each worker to a SINGLE intra-op thread. The per-protein tensor ops (cdist,
+    # topk, 3x3 eigh) are tiny, but torch/BLAS otherwise defaults to all cores in every
+    # worker -> N workers x 96 threads oversubscribe the box (same failure mode as
+    # foldseek's default --threads). Worker-level parallelism is where the speedup comes
+    # from, so 1 thread per worker is correct.
+    torch.set_num_threads(1)
     if device is not None:
-        # Per-protein tensor ops are tiny (PCA eigh is already CPU-forced); CPU avoids each
-        # worker spinning up its own MPS context and the dispatch overhead of many small
-        # kernels, which is usually a net win when lifting in parallel.
+        # CPU is the default and the fast path here: the ops are tiny, so per-worker
+        # CUDA/MPS context init + single-GPU contention across many workers is a net
+        # loss. `--device cuda` is supported for completeness (best with few workers).
         DEVICE = torch.device(device)
 
 
@@ -536,18 +556,37 @@ def main():
                     help="Output directory for the lifted .pt files (default: data/hoan_processed).")
     ap.add_argument('--max-protein', type=int, default=None,
                     help="Cap the number of PDBs processed (for testing).")
-    ap.add_argument('--workers', type=int, default=max(1, (os.cpu_count() or 8) // 2),
-                    help="Parallel worker processes.")
+    ap.add_argument('--workers', type=int, default=None,
+                    help="Parallel worker processes (default: cpu_count//2; 3/4 of cores under "
+                         "--deltafold). Each worker runs single-threaded foldseek + torch, so "
+                         "throughput scales with workers up to ~core count.")
     ap.add_argument('--skip-existing', action='store_true',
                     help="Skip PDBs whose .pt already exists in --out-dir (resume a big run).")
     ap.add_argument('--unprocessed-only', action='store_true',
                     help="Lift only not yet processed proteins (alias for --skip-existing).")
     ap.add_argument('--batch-size', type=int, default=32,
                     help="Number of PDBs to process per batch (default: 32).")
-    ap.add_argument('--device', choices=['cpu', 'mps'], default='cpu',
-                    help="Torch device for the per-protein tensor ops. Default cpu: faster "
-                         "here (tiny ops, no per-worker MPS init / GPU contention).")
+    ap.add_argument('--device', choices=['cpu', 'mps', 'cuda'], default='cpu',
+                    help="Torch device for the per-protein tensor ops. Default cpu, which is "
+                         "the fast path even on the L40S box: the ops are tiny (cdist/topk/3x3 "
+                         "eigh) and foldseek dominates, so CPU + many workers beats a single "
+                         "contended GPU. 'cuda' is supported for completeness (use few workers).")
     args = ap.parse_args()
+
+    # Resolve worker count: more cores available under --deltafold. CUDA can't use many
+    # workers (each spawns its own context on the one GPU), so cap it low there.
+    if args.workers is None:
+        cores = os.cpu_count() or 8
+        if args.device == 'cuda':
+            args.workers = 4
+        elif args.deltafold or deltafold_paths.deltafold_requested():
+            args.workers = max(1, cores * 3 // 4)
+        else:
+            args.workers = max(1, cores // 2)
+    if args.device == 'cuda' and args.workers > 8:
+        logging.warning(f"--device cuda with {args.workers} workers: each worker opens its own "
+                        f"CUDA context on the single GPU (heavy init + VRAM, and they contend). "
+                        f"For lifting, '--device cpu' is faster; if you want CUDA, use few workers.")
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
