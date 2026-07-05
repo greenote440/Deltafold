@@ -147,7 +147,8 @@ def _clustering_metrics(model_labels, fs_labels, n_perm=5, seed=0):
     if len(keep) < 2:
         return {'hdbscan_ari': nan, 'hdbscan_nmi': nan, 'homogeneity': nan,
                 'completeness': nan, 'v_measure': nan, 'fowlkes_mallows': nan,
-                'fragmentation': nan, 'fusion': nan, 'perm_ari': nan, 'n_eval': 0}
+                'fragmentation': nan, 'fusion': nan, 'pair_fpr': nan, 'pair_fnr': nan,
+                'perm_ari': nan, 'n_eval': 0}
     ml = [model_labels[i] for i in keep]
     fl = [fs_labels[i] for i in keep]
     from sklearn.metrics import (adjusted_rand_score, normalized_mutual_info_score,
@@ -159,6 +160,28 @@ def _clustering_metrics(model_labels, fs_labels, n_perm=5, seed=0):
         f2m[a].add(b); m2f[b].add(a)
     frag = sum(len(v) for v in f2m.values()) / len(f2m)
     fus = sum(len(v) for v in m2f.values()) / len(m2f)
+    # Pair-level false-positive / false-negative rates (§Pair FPR/FNR). A pair is a
+    # positive if the two proteins share a reference (Foldseek) fold; the clustering
+    # co-clusters them or not. Over the contingency counts n_ck = |C_c ∩ K_k|:
+    #   TP = Σ_ck C(n_ck,2);  FP = Σ_k C(n_k,2) - TP;  FN = Σ_c C(n_c,2) - TP;
+    #   TN = C(n,2) - TP - FP - FN.
+    #   FPR = FP/(FP+TN) = fraction of cross-fold pairs wrongly co-clustered (over-merge);
+    #   FNR = FN/(FN+TP) = fraction of same-fold pairs left split (over-split).
+    # Computed on the same `keep` subset as the other agreement metrics.
+    def _c2(x):
+        return x * (x - 1) // 2
+    cont = Counter(zip(fl, ml))
+    n_c = Counter(fl)
+    n_k = Counter(ml)
+    tp = sum(_c2(v) for v in cont.values())
+    sum_c = sum(_c2(v) for v in n_c.values())          # same-fold (positive) pairs
+    sum_k = sum(_c2(v) for v in n_k.values())
+    total_pairs = _c2(len(fl))
+    fp = sum_k - tp
+    fn = sum_c - tp
+    tn = total_pairs - tp - fp - fn
+    fpr = fp / (fp + tn) if (fp + tn) > 0 else nan     # = fp / (total_pairs - sum_c)
+    fnr = fn / (fn + tp) if (fn + tp) > 0 else nan     # = fn / sum_c
     # Mod 3 permutation-null ARI: shuffle the Foldseek labels (preserves marginal
     # cluster sizes) -> calibrated ARI floor. ARI_real - perm_ari = label contribution.
     rng = np.random.default_rng(seed)
@@ -172,6 +195,7 @@ def _clustering_metrics(model_labels, fs_labels, n_perm=5, seed=0):
         'v_measure': round(v_measure_score(fl, ml), 4),
         'fowlkes_mallows': round(fowlkes_mallows_score(fl, ml), 4),
         'fragmentation': round(frag, 3), 'fusion': round(fus, 3),
+        'pair_fpr': round(fpr, 4), 'pair_fnr': round(fnr, 4),
         'perm_ari': round(perm, 4), 'n_eval': len(keep),
     }
 
@@ -254,7 +278,7 @@ _FIELDS = ['epoch', 'n', 'n_clusters', 'singleton_frac', 'n_eval',
            'effective_rank', 'emb_std', 'mean_cos', 'uniformity',
            # Mod 3/4 clustering agreement
            'hdbscan_ari', 'hdbscan_nmi', 'homogeneity', 'completeness', 'v_measure',
-           'fowlkes_mallows', 'fragmentation', 'fusion', 'perm_ari']
+           'fowlkes_mallows', 'fragmentation', 'fusion', 'pair_fpr', 'pair_fnr', 'perm_ari']
 
 
 def log_row(csv_path, epoch, metrics):
@@ -275,6 +299,7 @@ def format_line(metrics):
             f"emb_std={g('emb_std')} mean_cos={g('mean_cos')} unif={g('uniformity')} | "
             f"ARI={g('hdbscan_ari')} (perm {g('perm_ari')}) Vm={g('v_measure')} "
             f"FM={g('fowlkes_mallows')} frag={g('fragmentation')} fus={g('fusion')} "
+            f"FPR={g('pair_fpr')} FNR={g('pair_fnr')} "
             f"[{g('n_clusters')} cl, {m.get('singleton_frac', 0):.0%} singl, n_eval={g('n_eval')}]")
 
 

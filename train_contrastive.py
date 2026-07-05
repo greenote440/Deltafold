@@ -1558,7 +1558,7 @@ def _run_training_epoch(model, head, train_loader, val_loader, optimizer, schedu
                                 # §6.1 health gate + Mod 3/4 (plan metrics)
                                 'tm_alignment','effective_rank','emb_std','mean_cos','uniformity',
                                 'homogeneity','completeness','v_measure','fowlkes_mallows',
-                                'fragmentation','fusion','perm_ari') if k in eval_metrics}
+                                'fragmentation','fusion','pair_fpr','pair_fnr','perm_ari') if k in eval_metrics}
     epoch_rec = {
         't': 'epoch', 'ep': epoch + 1,
         'steps': train_steps_done,
