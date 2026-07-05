@@ -200,8 +200,45 @@ def _clustering_metrics(model_labels, fs_labels, n_perm=5, seed=0):
     }
 
 
+def _cluster_labels(X, min_cluster_size, min_samples, epsilon):
+    """One HDBSCAN partition at a given cluster_selection_epsilon (noise/size-1 -> unique
+    negative ids). epsilon>0 merges sub-clusters within that (euclidean) distance."""
+    import hdbscan
+    lab = hdbscan.HDBSCAN(
+        min_cluster_size=min_cluster_size, min_samples=min_samples,
+        cluster_selection_epsilon=float(epsilon),
+        metric='euclidean', algorithm='best', core_dist_n_jobs=-1,
+    ).fit_predict(np.ascontiguousarray(X))
+    return _relabel_singletons(lab)
+
+
+def _select_epsilon(X, foldseek_labels, grid, fpr_cap, min_cluster_size, min_samples):
+    """Sweep HDBSCAN ``cluster_selection_epsilon`` and pick the value that MINIMISES the
+    pair FNR while keeping pair FPR <= ``fpr_cap``. Larger epsilon merges more sub-clusters
+    (FNR down, FPR up), so under a fixed FPR ceiling this is the most aggressive *safe*
+    merge — the protocol keeps FPR (over-merging unrelated folds) as the primary target,
+    which is why we cap it rather than minimise FNR unconstrained (that collapses to one
+    giant cluster: FNR=0, FPR=1). Returns (best_epsilon, best_labels, sweep) where sweep is
+    a list of (epsilon, fpr, fnr)."""
+    fl = list(foldseek_labels)
+    sweep, best = [], None            # best = (fnr, epsilon, labels)
+    for e in grid:
+        lab = _cluster_labels(X, min_cluster_size, min_samples, e)
+        m = _clustering_metrics(list(lab), fl)
+        fpr, fnr = m.get('pair_fpr'), m.get('pair_fnr')
+        sweep.append((round(float(e), 4), fpr, fnr))
+        ok = fpr is not None and fpr == fpr and fpr <= fpr_cap
+        has_fnr = fnr is not None and fnr == fnr
+        if ok and has_fnr and (best is None or fnr < best[0]):
+            best = (fnr, float(e), lab)
+    if best is None:                  # nothing met the cap (or all-nan) -> baseline eps=0
+        return 0.0, _cluster_labels(X, min_cluster_size, min_samples, 0.0), sweep
+    return best[1], best[2], sweep
+
+
 def evaluate(embs, ids, foldseek_labels, tm_cache=None, tm_cache_path='./checkpoints/tm_score_cache.pt',
-             min_cluster_size=2, min_samples=None, close_threshold=0.45, whiten='none'):
+             min_cluster_size=2, min_samples=None, close_threshold=0.45, whiten='none',
+             cluster_selection_epsilon=None, tune_epsilon=True, epsilon_grid=None, fpr_cap=0.01):
     # NOTE: min_samples=None lets HDBSCAN use its default (= min_cluster_size). The
     # old default min_samples=1 over-fragments hard (every point joins a tiny
     # cluster), which crushed ARI and masked real differences — e.g. ep24 ARI went
@@ -215,15 +252,23 @@ def evaluate(embs, ids, foldseek_labels, tm_cache=None, tm_cache_path='./checkpo
     foldseek_labels list of N labels (Foldseek cluster rep / id), aligned with embs rows.
     Returns a metrics dict.
     """
-    import hdbscan
     X = _l2(decollapse(embs, whiten))     # optional fixed de-collapse before metrics
     N = X.shape[0]
 
-    labels = hdbscan.HDBSCAN(
-        min_cluster_size=min_cluster_size, min_samples=min_samples,
-        metric='euclidean', algorithm='best', core_dist_n_jobs=-1,
-    ).fit_predict(np.ascontiguousarray(X))
-    labels = _relabel_singletons(labels)
+    # Pick cluster_selection_epsilon BEFORE the final clustering. Fixed value if given;
+    # otherwise sweep the grid and take the epsilon that minimises pair FNR at FPR<=fpr_cap
+    # (see _select_epsilon). tune_epsilon=False reproduces the old single fit (epsilon 0).
+    if epsilon_grid is None:
+        epsilon_grid = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5]
+    if cluster_selection_epsilon is not None:
+        selected_epsilon = float(cluster_selection_epsilon)
+        labels = _cluster_labels(X, min_cluster_size, min_samples, selected_epsilon)
+    elif tune_epsilon:
+        selected_epsilon, labels, _sweep = _select_epsilon(
+            X, foldseek_labels, epsilon_grid, fpr_cap, min_cluster_size, min_samples)
+    else:
+        selected_epsilon = 0.0
+        labels = _cluster_labels(X, min_cluster_size, min_samples, 0.0)
     singleton_frac = float((labels < 0).mean())
     n_clusters = int(len({int(l) for l in labels if l >= 0}))
 
@@ -260,7 +305,7 @@ def evaluate(embs, ids, foldseek_labels, tm_cache=None, tm_cache_path='./checkpo
 
     out = {
         'n': N, 'n_clusters': n_clusters, 'singleton_frac': round(singleton_frac, 4),
-        'n_eval': n_eval,
+        'n_eval': n_eval, 'selected_epsilon': round(selected_epsilon, 4),
         'tm_rho': round(tm_rho, 4) if tm_rho == tm_rho else float('nan'),
         'tm_recall': round(tm_recall, 4) if tm_recall == tm_recall else float('nan'),
         'tm_alignment': round(tm_alignment, 4) if tm_alignment == tm_alignment else float('nan'),
@@ -272,7 +317,7 @@ def evaluate(embs, ids, foldseek_labels, tm_cache=None, tm_cache_path='./checkpo
     return out
 
 
-_FIELDS = ['epoch', 'n', 'n_clusters', 'singleton_frac', 'n_eval',
+_FIELDS = ['epoch', 'n', 'n_clusters', 'singleton_frac', 'n_eval', 'selected_epsilon',
            'tm_rho', 'tm_recall', 'tm_alignment', 'n_tm_pairs',
            # §6.1 health gate
            'effective_rank', 'emb_std', 'mean_cos', 'uniformity',
@@ -299,7 +344,7 @@ def format_line(metrics):
             f"emb_std={g('emb_std')} mean_cos={g('mean_cos')} unif={g('uniformity')} | "
             f"ARI={g('hdbscan_ari')} (perm {g('perm_ari')}) Vm={g('v_measure')} "
             f"FM={g('fowlkes_mallows')} frag={g('fragmentation')} fus={g('fusion')} "
-            f"FPR={g('pair_fpr')} FNR={g('pair_fnr')} "
+            f"FPR={g('pair_fpr')} FNR={g('pair_fnr')} eps={g('selected_epsilon')} "
             f"[{g('n_clusters')} cl, {m.get('singleton_frac', 0):.0%} singl, n_eval={g('n_eval')}]")
 
 
@@ -309,6 +354,15 @@ def main():
                     help="Embeddings .pt produced by extract_embeddings.py (full-dataset deep check).")
     ap.add_argument('--tm-cache', default='./checkpoints/tm_score_cache.pt')
     ap.add_argument('--min-cluster-size', type=int, default=2)
+    ap.add_argument('--epsilon', type=float, default=None,
+                    help="Fixed HDBSCAN cluster_selection_epsilon (skips the sweep).")
+    ap.add_argument('--no-tune-epsilon', dest='tune_epsilon', action='store_false',
+                    help="Disable the epsilon sweep; cluster once at epsilon 0 (old behaviour).")
+    ap.add_argument('--fpr-cap', type=float, default=0.01,
+                    help="FPR ceiling for the epsilon sweep: minimise FNR subject to pair "
+                         "FPR <= this (default 0.01; keeps over-merging near zero).")
+    ap.add_argument('--epsilon-grid', default=None,
+                    help="Comma-separated epsilon values to sweep (default 0,0.1,0.2,0.3,0.4,0.5).")
     ap.add_argument('--log', default=None, help="Optional CSV to append the result to.")
     ap.add_argument('--epoch', default='full', help="Epoch label for the logged row.")
     ap.add_argument('--whiten', choices=['none', 'center', 'pca'], default='none',
@@ -338,9 +392,13 @@ def main():
                             rep_of[c[1]] = c[0]
         print(f"  cluster source: FoldSeek pairwise ({len(set(rep_of.values()))} clusters)")
     fs_labels = [rep_of.get(i, i) for i in ids]
-    print(f"{len(ids)} embeddings | evaluating (whiten={args.whiten}) ...")
+    grid = ([float(x) for x in args.epsilon_grid.split(',')] if args.epsilon_grid else None)
+    print(f"{len(ids)} embeddings | evaluating (whiten={args.whiten}, "
+          f"tune_epsilon={args.tune_epsilon}, fpr_cap={args.fpr_cap}) ...")
     m = evaluate(X, ids, fs_labels, tm_cache_path=args.tm_cache,
-                 min_cluster_size=args.min_cluster_size, whiten=args.whiten)
+                 min_cluster_size=args.min_cluster_size, whiten=args.whiten,
+                 cluster_selection_epsilon=args.epsilon, tune_epsilon=args.tune_epsilon,
+                 epsilon_grid=grid, fpr_cap=args.fpr_cap)
     print(format_line(m))
     if args.log:
         log_row(args.log, args.epoch, m)

@@ -105,6 +105,7 @@ def build_markdown(run_dir, epochs, collapses, config):
     A(f"| Fusion | {ev('fusion')} | 1 | mean folds merged into one learned cluster (over-merge) |")
     A(f"| Pair FPR | {ev('pair_fpr')} | 0 | cross-fold pairs wrongly co-clustered (— if not logged) |")
     A(f"| Pair FNR | {ev('pair_fnr')} | low | same-fold pairs split apart (— if not logged) |")
+    A(f"| selected ε (HDBSCAN) | {ev('selected_epsilon')} | — | tuned to min FNR at FPR≤cap |")
     A("")
     A("### Secondary summaries (§ARI, §TM-ρ)")
     A("")

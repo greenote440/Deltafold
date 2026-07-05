@@ -1554,7 +1554,7 @@ def _run_training_epoch(model, head, train_loader, val_loader, optimizer, schedu
         ev_compact = {k: _safe(eval_metrics[k]) if isinstance(eval_metrics[k], float)
                       else eval_metrics[k]
                       for k in ('hdbscan_ari','hdbscan_nmi','tm_rho','tm_recall',
-                                'n_clusters','singleton_frac',
+                                'n_clusters','singleton_frac','selected_epsilon',
                                 # §6.1 health gate + Mod 3/4 (plan metrics)
                                 'tm_alignment','effective_rank','emb_std','mean_cos','uniformity',
                                 'homogeneity','completeness','v_measure','fowlkes_mallows',
