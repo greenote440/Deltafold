@@ -37,9 +37,9 @@ case "$cmd" in
   push-dry)  rsync -azn --delete --itemize-changes "${CODE_EX[@]}" "$LOCAL/" "$BOX/" ;;
   pull-ckpt) run="${1:?usage: pull-ckpt <run_folder>}"
              mkdir -p "$LOCAL/checkpoints/$run"
-             rsync -az --info=progress2 "$BOX/checkpoints/$run/" "$LOCAL/checkpoints/$run/" ;;
+             rsync -az --progress "$BOX/checkpoints/$run/" "$LOCAL/checkpoints/$run/" ;;
   pull)      p="${1:?usage: pull <repo-relative-path>}"
-             rsync -azR --info=progress2 "${BOX%/}/./$p" "$LOCAL/" ;;
+             rsync -azR --progress "${BOX%/}/./$p" "$LOCAL/" ;;
   *)         echo "usage: $(basename "$0") {push|push-dry|pull-ckpt <run>|pull <path>}"; exit 1 ;;
 esac
 echo "done: $cmd ${1:-}"
