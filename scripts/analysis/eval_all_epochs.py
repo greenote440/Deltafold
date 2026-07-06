@@ -41,6 +41,9 @@ def main():
     ap.add_argument("--run-dir", required=True, help="Folder with checkpoint_*epochNNN.pth.")
     ap.add_argument("--file-list", required=True, help="Validation protein manifest.")
     ap.add_argument("--model", default="topotein")
+    ap.add_argument("--epsilon", type=float, default=None,
+                    help="Fixed HDBSCAN cluster_selection_epsilon for every epoch (skips the "
+                         "per-epoch sweep -> much faster). Default: auto-tune per epoch.")
     ap.add_argument("--fpr-cap", type=float, default=0.01)
     ap.add_argument("--max-residues", type=int, default=12000)
     ap.add_argument("--batch-size", type=int, default=64)
@@ -51,8 +54,9 @@ def main():
 
     repo = str(Path(__file__).resolve().parent.parent.parent)
     extract = os.path.join(repo, "scripts", "utilities", "extract_embeddings.py")
-    out_csv = args.out_csv or os.path.join(args.run_dir, "epoch_metrics_tuned.csv")
-    out_png = args.out_png or os.path.join(args.run_dir, "epoch_metrics_tuned.png")
+    tag = "tuned" if args.epsilon is None else f"eps{args.epsilon:g}"
+    out_csv = args.out_csv or os.path.join(args.run_dir, f"epoch_metrics_{tag}.csv")
+    out_png = args.out_png or os.path.join(args.run_dir, f"epoch_metrics_{tag}.png")
     tmp_emb = os.path.join(tempfile.gettempdir(), "eae_emb.pt")
 
     cks = sorted(glob.glob(os.path.join(args.run_dir, "checkpoint_*epoch*.pth")),
@@ -78,7 +82,9 @@ def main():
             continue
         ids, X = cc.load_embeddings(tmp_emb)
         fl = [nomburg.get(i, i) for i in ids]
-        m = epoch_eval.evaluate(X, ids, fl, tm_cache={}, tune_epsilon=True, fpr_cap=args.fpr_cap)
+        m = epoch_eval.evaluate(X, ids, fl, tm_cache={},
+                                cluster_selection_epsilon=args.epsilon,
+                                tune_epsilon=(args.epsilon is None), fpr_cap=args.fpr_cap)
         row = {"epoch": ep, "pair_fnr": m.get("pair_fnr"), "pair_fpr": m.get("pair_fpr"),
                "fragmentation": m.get("fragmentation"), "fusion": m.get("fusion"),
                "selected_epsilon": m.get("selected_epsilon"), "hdbscan_ari": m.get("hdbscan_ari"),
@@ -100,7 +106,7 @@ def main():
     for a, (k, title) in zip(ax.flat, PANELS):
         y = [r[k] for r in rows]
         a.plot(E, y, marker="o", ms=3, lw=1.5)
-        if k in ("pair_fpr",):
+        if k == "pair_fpr" and args.epsilon is None:
             a.axhline(args.fpr_cap, ls="--", c="r", lw=0.8, label=f"cap {args.fpr_cap}")
             a.legend(fontsize=8)
         if k in ("fragmentation", "fusion"):
@@ -108,8 +114,9 @@ def main():
         a.set_title(title, fontsize=10)
         a.set_xlabel("epoch")
         a.grid(alpha=0.3)
-    fig.suptitle(f"Auto-tuned-ε eval vs epoch — {os.path.basename(args.run_dir.rstrip('/'))} "
-                 f"(FPR≤{args.fpr_cap:g}, n≈{rows[-1]['n_eval'] if rows else 0} eval)")
+    eps_desc = "auto-tuned ε" if args.epsilon is None else f"fixed ε={args.epsilon:g}"
+    fig.suptitle(f"HDBSCAN eval vs epoch — {os.path.basename(args.run_dir.rstrip('/'))} "
+                 f"({eps_desc}, n≈{rows[-1]['n_eval'] if rows else 0} eval)")
     fig.tight_layout()
     fig.savefig(out_png, dpi=130)
     print(f"wrote {out_csv} and {out_png} ({len(rows)} epochs)")
