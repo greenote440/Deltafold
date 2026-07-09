@@ -136,21 +136,26 @@ def _health_metrics(X, max_pairs=1000, seed=0):
 
 
 def _clustering_metrics(model_labels, fs_labels, n_perm=5, seed=0):
-    """ARI/NMI + Mod 4 directional agreement (V-measure / homogeneity / completeness
-    / Fowlkes–Mallows, fragmentation/fusion) + Mod 3 permutation-null ARI, all on the
-    subset where model AND Foldseek clusters are both multi-member."""
+    """ARI/NMI + directional agreement (V-measure / homogeneity / completeness /
+    Fowlkes-Mallows, fragmentation/fusion) + pair FPR/FNR + permutation-null ARI, over
+    the FULL protein set (protocol Metrics). HDBSCAN noise / size-1 points are already
+    unique singletons (via _relabel_singletons), so a same-fold protein the model leaves
+    as noise correctly counts as a split (FN) pair. Earlier these ran on the 'both
+    multi-member' subset, which dropped the ~50% noise/singletons and made FNR and
+    fragmentation look far better than they are. n_eval = that both-multi-member count,
+    kept only for context."""
     from collections import Counter, defaultdict
     mc, fc = Counter(model_labels), Counter(fs_labels)
-    keep = [i for i in range(len(model_labels))
-            if mc[model_labels[i]] >= 2 and fc[fs_labels[i]] >= 2]
+    n_eval = sum(1 for i in range(len(model_labels))
+                 if mc[model_labels[i]] >= 2 and fc[fs_labels[i]] >= 2)
     nan = float('nan')
-    if len(keep) < 2:
+    if len(model_labels) < 2:
         return {'hdbscan_ari': nan, 'hdbscan_nmi': nan, 'homogeneity': nan,
                 'completeness': nan, 'v_measure': nan, 'fowlkes_mallows': nan,
                 'fragmentation': nan, 'fusion': nan, 'pair_fpr': nan, 'pair_fnr': nan,
                 'perm_ari': nan, 'n_eval': 0}
-    ml = [model_labels[i] for i in keep]
-    fl = [fs_labels[i] for i in keep]
+    ml = list(model_labels)
+    fl = list(fs_labels)
     from sklearn.metrics import (adjusted_rand_score, normalized_mutual_info_score,
                                  homogeneity_score, completeness_score, v_measure_score,
                                  fowlkes_mallows_score)
@@ -158,8 +163,12 @@ def _clustering_metrics(model_labels, fs_labels, n_perm=5, seed=0):
     f2m, m2f = defaultdict(set), defaultdict(set)
     for a, b in zip(fl, ml):
         f2m[a].add(b); m2f[b].add(a)
-    frag = sum(len(v) for v in f2m.values()) / len(f2m)
-    fus = sum(len(v) for v in m2f.values()) / len(m2f)
+    # Averaged over multi-member clusters of each side (a singleton fold/cluster can't
+    # fragment, and including them would just dilute toward 1).
+    frag_v = [len(v) for c, v in f2m.items() if fc[c] >= 2]
+    fus_v = [len(v) for k, v in m2f.items() if mc[k] >= 2]
+    frag = (sum(frag_v) / len(frag_v)) if frag_v else nan
+    fus = (sum(fus_v) / len(fus_v)) if fus_v else nan
     # Pair-level false-positive / false-negative rates (§Pair FPR/FNR). A pair is a
     # positive if the two proteins share a reference (Foldseek) fold; the clustering
     # co-clusters them or not. Over the contingency counts n_ck = |C_c ∩ K_k|:
@@ -196,7 +205,7 @@ def _clustering_metrics(model_labels, fs_labels, n_perm=5, seed=0):
         'fowlkes_mallows': round(fowlkes_mallows_score(fl, ml), 4),
         'fragmentation': round(frag, 3), 'fusion': round(fus, 3),
         'pair_fpr': round(fpr, 4), 'pair_fnr': round(fnr, 4),
-        'perm_ari': round(perm, 4), 'n_eval': len(keep),
+        'perm_ari': round(perm, 4), 'n_eval': n_eval,
     }
 
 

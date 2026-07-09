@@ -351,7 +351,7 @@ where $\mathbf{v}^{1}_e$ is the only raw vector feature in the complex and
 $\mathrm{RBF}(\cdot)$ is a radial-basis expansion of the distance (specified in a
 later iteration).
 
-\paragraph{Ranks 2 and 3 --- SSEs and protein.} Residues receive a DSSP-style
+\paragraph{Ranks 2 and 3 --- SSEs and protein.} Residues receive a PSEA
 three-state label (helix, strand, loop); maximal runs of one label form the SSEs,
 and $\sigma(i)$ records membership. A point set $\{\mathbf{c}_i\}_{i=1}^{m}$ (the
 residues of one SSE for rank 2, the whole chain for rank 3) with centroid
@@ -379,16 +379,6 @@ distances only, hence invariant to rotation and translation. Ranks 1--3 have no
 raw vector feature; their vector channels are seeded from $\mathbf{v}^{1}$ in
 Section~\ref{sec:embed}.
 
-\begin{figure}[h]
-\centering
-\fbox{\parbox[c][3.4cm][c]{0.9\textwidth}{\centering\itshape
-visualisation placeholder --- lifting one structure into the PCC: C$\alpha$ trace
-$\to$ $k$-NN contact graph (rank 1) $\to$ DSSP segments (rank 2) $\to$ protein cell
-(rank 3), with the scalar feature carried by each rank and the displacement vector
-on the edges.}}
-\caption{[to be added] Featurization of one protein into its Protein Combinatorial Complex.}
-\end{figure}
-
 \subsection{Train / validation split}
 \label{sec:split}
 
@@ -412,8 +402,7 @@ used only to evaluate the embeddings, never during training.
 structural cluster and each diamond a protein. Whole clusters --- not individual
 proteins --- are assigned to train ($\sim$80\%) or validation ($\sim$20\%), so no
 structural cluster spans the split and no near-duplicate fold can leak from one set
-to the other. Each cluster is then subsampled at the common rate $f$, preserving the
-cluster-size distribution.}
+to the other. Each cluster is then subsampled at the common rate $f$}
 \end{figure}
 
 \section{Architecture}
@@ -926,6 +915,123 @@ low; values near 0.9 to 0.97 mean the vectors are nearly parallel), and the
 effective rank of the embedding covariance as a single number for how many
 dimensions are actually being used. I would only interpret a checkpoint
 biologically if these are healthy at that epoch.
+
+
+
+\section{First results}
+\label{sec:results}
+
+This section records the first end-to-end run of the pipeline. It is a
+\emph{single configuration and a single seed}, so the numbers are a starting
+point rather than a validated result; the aim is to document what was obtained and
+to fix the questions that must be answered before any of it is read biologically.
+
+\subsection{The run}
+
+The encoder is the Topotein/TCPNet of Section~\ref{sec:architecture}, trained for
+$40$ epochs on a single NVIDIA L40S. Configuration: MoCo contrastive objective with
+substructure positives (contiguous, fraction $f\in[0.4,0.7]$), temperature
+$\tau=0.2$, queue $K=8192$; residue identity, 3Di and positional encodings all
+disabled, so the only per-residue input is the $(\phi,\psi)$ pair and the geometry;
+scalar width $d_s=128$, vector width $d_v=16$, $L=4$ interaction layers,
+edge-centric chiral frames, node-pooling readout. Train/validation is the cold
+Nomburg-cluster split of Section~\ref{sec:split} ($55{,}911$ train / $11{,}787$
+validation proteins); reference labels are the Nomburg merged structural clusters
+($18{,}192$ clusters). Clustering metrics are HDBSCAN over the $\ell_2$-normalised
+validation embeddings versus those reference clusters.
+
+\subsection{Metrics obtained}
+
+The pair and cluster metrics are computed \emph{globally}, over all $\binom{n}{2}$
+protein pairs of the full dataset: because HDBSCAN leaves $\approx 53\%$ of proteins as
+noise, and a same-fold protein left unclustered is a genuine false negative, each noise
+point is treated as its own singleton (an earlier version scored only the ``both
+multi-member'' subset, which excluded the noise and singletons and badly under-reported
+FNR and fragmentation). HDBSCAN itself has no single density threshold: it extracts a
+flat clustering from the whole density hierarchy by cluster persistence, controlled by
+\texttt{min\_cluster\_size} and \texttt{min\_samples}. Sweeping those, a central
+negative result emerges: \textbf{there is no operating point with both low FNR and
+near-zero FPR}. Two ends of the trade-off at epoch~$25$ (full dataset):
+
+\begin{center}
+\begin{tabular}{@{}l l l l l@{}}
+\toprule
+Operating point & FNR & FPR & ARI & noise\\
+\midrule
+High precision (persistence, $\sim$pure) & $0.90$ & $0.00$ & $0.18$ & $0.53$\\
+Higher recall (flat cut $\approx0.25$, \texttt{min\_samples}$=1$) & $0.53$ & $0.15$ & $0.01$ & $0.35$\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+At the precision end the model almost never merges unrelated folds
+($\mathrm{FPR}\approx 0$, permutation-null $\mathrm{ARI}\approx 0$) but leaves
+$\sim 90\%$ of same-fold pairs unclustered. Pushing for recall (merging more) drops FNR
+to $\sim 0.5$ only by raising FPR to $\sim 0.15$ and collapsing ARI toward zero --- the
+extra recall comes from indiscriminate merging, not from better structure. In both
+regimes the \emph{discrete} agreement with the Nomburg reference is weak, at every
+HDBSCAN setting tried.
+
+The \emph{continuous} signal, by contrast, is strong. The clustering-free check is
+$\mathrm{TM}\text{-}\rho = -0.69$ over $7{,}059$ sampled pairs: the latent geometry
+ranks structural similarity well even though a density clustering of it does not. The
+health checks of Section~\ref{sec:health} pass throughout --- per-dimension spread
+$\approx 0.075$ (well above the $0.02$ collapse floor), mean off-diagonal cosine
+$\approx 0.24$, uniformity $\approx -2.5$, effective rank $\approx 44$ of $128$ --- so
+the representation is not collapsed.
+
+The reading so far is therefore mixed: DeltaFold appears to learn a meaningful
+\emph{continuous} structural metric (strong TM-$\rho$, healthy geometry), but a
+density-based clustering of that space does not reconstruct the Nomburg fold partition.
+Whether that is a granularity mismatch (the $18{,}192$ reference clusters being coarser
+or finer than the embedding's density structure), folds that are simply not
+density-separated, or a genuine limit of the current encoder, is exactly what the
+questions below must resolve.
+
+\paragraph{A caveat behind the aggregate.} The largest reference folds are shattered:
+the five biggest Nomburg clusters ($1952,1591,1074,855,463$ members) split into
+$115,173,95,45$ and $36$ model clusters, $\approx 35$--$53\%$ of each left as noise; and
+the \emph{mean} per-cluster FNR across all multi-member reference clusters is
+$\approx 0.86$. The favourable-looking numbers of the first draft were an artefact of
+the excluded-noise subset, not a property of the model.
+
+\subsection{Questions to confirm a biological signal}
+\label{sec:results-questions}
+
+Whether the above is genuine structural learning --- as opposed to an easy shortcut,
+a degenerate representation, or an artefact of the reference labels --- is not yet
+established. The following must be answered before any biological reading.
+
+\begin{itemize}[leftmargin=1.4em,itemsep=1pt]
+\item \emph{Above the floor and below the target?} Report every number against the
+      two references of Section~\ref{sec:plan}: a shuffled-embedding baseline and a
+      random-initialised encoder (a floor), and Foldseek on the same split (the
+      method to beat). Permutation-null ARI $\approx 0$ is necessary but not
+      sufficient.
+\item \emph{Structural, or a global-shape shortcut?} Sequence and composition
+      shortcuts are excluded by construction (no amino-acid, 3Di or positional
+      inputs). But the rank-3 cochain carries size, $R_g$ and shape eigenvalues:
+      test whether the cluster assignment correlates with chain length / $R_g$, and
+      re-measure with the rank-3 channel dropped (the no-rank-3 tensor diagram).
+\item \emph{Generalisation, not leakage?} The split is cold at the cluster level, so
+      validation folds are unseen; confirm the train--validation gap is small and
+      that no reference cluster spans the split.
+\item \emph{Is TM-$\rho$ real?} Recompute on a large, uniformly sampled pair set with
+      a full TM cache, and check the correlation holds across the whole TM range
+      rather than being driven by a few extremes.
+\item \emph{Are the mega-fold sub-clusters biology or failure?} For a shattered big
+      fold, do the model sub-clusters correspond to meaningful sub-families
+      (taxonomy, function, sequence/MSA sub-structure), or are they arbitrary? (This
+      is the per-reference-cluster sub-cluster FASTA / alignment analysis.)
+\item \emph{Is the reference the right yardstick?} With $18{,}192$ Nomburg clusters,
+      fragmentation/fusion partly measure a granularity mismatch; cross-check against
+      a second reference (Foldseek at another threshold) and against continuous
+      TM-score.
+\item \emph{Robustness and the decisive ablation.} Repeat over seeds, and run the
+      \emph{Topotein-default vs.\ residue-hub} comparison of Section~\ref{sec:sweep}
+      to confirm that the inter-SSE topological channel --- not geometry alone ---
+      drives the recovery.
+\end{itemize}
 
 
 
